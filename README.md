@@ -52,8 +52,9 @@ so it is not shipped with the payload. When that fails, the notification shows w
 1. In Home Assistant, install the **Mosquitto broker** add-on (Settings, Add-ons), and create a user for the console
    (Settings, People, Users), for example `ps5`.
 2. Load `ps5-homeassistant.elf` with your ELF loader, or put it in ps5-autoloader's list between ps5-exporter and
-   ps5-signal. Signal Companion can do this for you.
-3. Set the broker, in Signal Companion, or from a program on the console:
+   ps5-signal. [Signal Companion](https://github.com/Marice/ps5-signal-companion) 00.003.000 does both on its
+   Payloads screen.
+3. Set the broker on Signal Companion's Payloads screen, or from a program on the console:
 
    ```sh
    curl -X PUT http://127.0.0.1:9160/config \
