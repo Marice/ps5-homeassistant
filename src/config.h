@@ -1,9 +1,11 @@
 /* /data/ps5-homeassistant/config.json: where the broker is and how often to publish.
  *
- *   { "host": "192.168.1.10", "port": 1883, "username": "ps5", "password": "...", "interval": 10 }
+ *   { "host": "192.168.1.10", "port": 1883, "username": "ps5", "password": "...", "interval": 10,
+ *     "power_actions": false }
  *
  * host is a name or an IPv4 address; port 1-65535; username up to 64 bytes and password up to 128 (both may
- * be empty, and may not hold a quote or backslash); interval 5-300 seconds. The password is stored as given: MQTT sends it as given too. */
+ * be empty, and may not hold a quote or backslash); interval 5-300 seconds. The password is stored as given: MQTT sends it as given too.
+ * power_actions (default false) lets Home Assistant put the console in rest mode or turn it off. */
 #ifndef CONFIG_H
 #define CONFIG_H
 
@@ -22,9 +24,10 @@ typedef struct {
 	char username[65];
 	char password[129];
 	int interval;
+	bool power_actions;
 } config;
 
-/* Defaults: no host (not configured), port 1883, interval 10. */
+/* Defaults: no host (not configured), port 1883, interval 10, no power actions. */
 void config_defaults(config* out);
 /* Checks text as a config. Fields left out keep the value in out (so a PUT may leave the password out).
    False with a reason in error when it isn't valid; out is then unchanged. */

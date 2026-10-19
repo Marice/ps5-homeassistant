@@ -32,6 +32,7 @@ typedef struct {
 	char model[64];
 	char firmware[16];
 	char exporter_version[16];
+	char address[16];       /* the console's IPv4 address on the network, "" when unknown */
 } readings;
 
 /* Reads the subset of Prometheus text the bridge needs into out (pure; tested on the host). */

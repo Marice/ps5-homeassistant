@@ -12,42 +12,48 @@ typedef struct {
 	const char* name;
 	const char* members; /* without the leading comma */
 	bool needs_signal;   /* also unavailable while ps5-signal does not answer */
+	bool power;          /* only while power actions are on; otherwise its discovery is removed */
+	bool keeps_value;    /* no availability: keeps its last value while the console sleeps */
 } entity;
 
 #define VALUE(key) "\"value_template\":\"{{ value_json." key " }}\""
 
 static const entity ENTITIES[] = {
 	{ "sensor", "temperature", "Temperature",
-	  "\"device_class\":\"temperature\",\"unit_of_measurement\":\"\xC2\xB0" "C\",\"state_class\":\"measurement\"," VALUE("temperature"), false },
+	  "\"device_class\":\"temperature\",\"unit_of_measurement\":\"\xC2\xB0" "C\",\"state_class\":\"measurement\"," VALUE("temperature"), false, false, false },
 	{ "sensor", "power", "Power",
-	  "\"device_class\":\"power\",\"unit_of_measurement\":\"W\",\"state_class\":\"measurement\"," VALUE("power"), false },
+	  "\"device_class\":\"power\",\"unit_of_measurement\":\"W\",\"state_class\":\"measurement\"," VALUE("power"), false, false, false },
 	{ "sensor", "gpu_power", "GPU power",
-	  "\"device_class\":\"power\",\"unit_of_measurement\":\"W\",\"state_class\":\"measurement\"," VALUE("gpu_power"), false },
+	  "\"device_class\":\"power\",\"unit_of_measurement\":\"W\",\"state_class\":\"measurement\"," VALUE("gpu_power"), false, false, false },
 	{ "sensor", "fan", "Fan",
-	  "\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\",\"icon\":\"mdi:fan\"," VALUE("fan"), false },
+	  "\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\",\"icon\":\"mdi:fan\"," VALUE("fan"), false, false, false },
 	{ "sensor", "cpu_load", "CPU load",
-	  "\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\",\"icon\":\"mdi:cpu-64-bit\"," VALUE("cpu_load"), false },
+	  "\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\",\"icon\":\"mdi:cpu-64-bit\"," VALUE("cpu_load"), false, false, false },
 	{ "sensor", "gpu_clock", "GPU clock",
-	  "\"device_class\":\"frequency\",\"unit_of_measurement\":\"MHz\",\"state_class\":\"measurement\"," VALUE("gpu_clock"), false },
+	  "\"device_class\":\"frequency\",\"unit_of_measurement\":\"MHz\",\"state_class\":\"measurement\"," VALUE("gpu_clock"), false, false, false },
 	{ "sensor", "fps", "Frame rate",
-	  "\"unit_of_measurement\":\"fps\",\"state_class\":\"measurement\",\"icon\":\"mdi:speedometer\"," VALUE("fps"), false },
-	{ "sensor", "game", "Game", "\"icon\":\"mdi:gamepad-variant\"," VALUE("game"), false },
-	{ "sensor", "game_id", "Game title ID", "\"icon\":\"mdi:identifier\",\"entity_category\":\"diagnostic\"," VALUE("game_id"), false },
+	  "\"unit_of_measurement\":\"fps\",\"state_class\":\"measurement\",\"icon\":\"mdi:speedometer\"," VALUE("fps"), false, false, false },
+	{ "sensor", "game", "Game", "\"icon\":\"mdi:gamepad-variant\"," VALUE("game"), false, false, false },
+	{ "sensor", "game_id", "Game title ID", "\"icon\":\"mdi:identifier\",\"entity_category\":\"diagnostic\"," VALUE("game_id"), false, false, false },
 	{ "sensor", "uptime", "Uptime",
-	  "\"device_class\":\"duration\",\"unit_of_measurement\":\"s\",\"entity_category\":\"diagnostic\"," VALUE("uptime"), false },
+	  "\"device_class\":\"duration\",\"unit_of_measurement\":\"s\",\"entity_category\":\"diagnostic\"," VALUE("uptime"), false, false, false },
 	{ "sensor", "free_space", "Free space",
-	  "\"device_class\":\"data_size\",\"unit_of_measurement\":\"GB\",\"suggested_display_precision\":1,\"state_class\":\"measurement\"," VALUE("free_space"), false },
+	  "\"device_class\":\"data_size\",\"unit_of_measurement\":\"GB\",\"suggested_display_precision\":1,\"state_class\":\"measurement\"," VALUE("free_space"), false, false, false },
+	{ "sensor", "ip_address", "IP address",
+	  "\"icon\":\"mdi:ip-network\",\"entity_category\":\"diagnostic\"," VALUE("ip_address"), false, false, true },
 	{ "binary_sensor", "game_running", "Game running",
-	  "\"icon\":\"mdi:controller\",\"payload_on\":true,\"payload_off\":false," VALUE("game_running"), false },
+	  "\"icon\":\"mdi:controller\",\"payload_on\":true,\"payload_off\":false," VALUE("game_running"), false, false, false },
 	{ "binary_sensor", "exporter", "ps5-exporter",
-	  "\"device_class\":\"connectivity\",\"entity_category\":\"diagnostic\",\"payload_on\":true,\"payload_off\":false," VALUE("exporter"), false },
+	  "\"device_class\":\"connectivity\",\"entity_category\":\"diagnostic\",\"payload_on\":true,\"payload_off\":false," VALUE("exporter"), false, false, false },
 	{ "binary_sensor", "signal", "ps5-signal",
-	  "\"device_class\":\"connectivity\",\"entity_category\":\"diagnostic\",\"payload_on\":true,\"payload_off\":false," VALUE("signal"), false },
+	  "\"device_class\":\"connectivity\",\"entity_category\":\"diagnostic\",\"payload_on\":true,\"payload_off\":false," VALUE("signal"), false, false, false },
 	{ "notify", "notify", "Notification",
-	  "\"icon\":\"mdi:message-text\",\"command_template\":\"{{ {'title': title, 'message': message} | tojson }}\"", false },
-	{ "button", "beep", "Beep", "\"icon\":\"mdi:volume-high\",\"payload_press\":\"PRESS\"", true },
-	{ "button", "blink", "Blink the light", "\"icon\":\"mdi:lightbulb-on\",\"payload_press\":\"PRESS\"", true },
-	{ "select", "colour", "Light colour", "\"icon\":\"mdi:palette\",\"optimistic\":true", true },
+	  "\"icon\":\"mdi:message-text\",\"command_template\":\"{{ {'title': title, 'message': message} | tojson }}\"", false, false, false },
+	{ "button", "beep", "Beep", "\"icon\":\"mdi:volume-high\",\"payload_press\":\"PRESS\"", true, false, false },
+	{ "button", "blink", "Blink the light", "\"icon\":\"mdi:lightbulb-on\",\"payload_press\":\"PRESS\"", true, false, false },
+	{ "select", "colour", "Light colour", "\"icon\":\"mdi:palette\",\"optimistic\":true", true, false, false },
+	{ "button", "rest", "Rest mode", "\"icon\":\"mdi:power-sleep\",\"payload_press\":\"PRESS\"", false, true, false },
+	{ "button", "power_off", "Power off", "\"icon\":\"mdi:power\",\"payload_press\":\"PRESS\"", false, true, false },
 };
 #define ENTITY_COUNT ((int)(sizeof(ENTITIES) / sizeof(ENTITIES[0])))
 
@@ -102,12 +108,13 @@ static void add_text(Buf* b, const char* text, bool escaped)
 	}
 }
 
-bool discovery_message(int index, const char* id, const readings* r, const char* version, char* topic, size_t topic_cap,
-                       Buf* b)
+bool discovery_message(int index, const char* id, const readings* r, bool power_actions, const char* version, char* topic,
+                       size_t topic_cap, Buf* b)
 {
 	if (index < 0 || index >= ENTITY_COUNT) return false;
 	const entity* e = &ENTITIES[index];
 	snprintf(topic, topic_cap, DISCOVERY_PREFIX "/%s/ps5_%s/%s/config", e->component, id, e->object);
+	if (e->power && !power_actions) return true; /* an empty retained config removes the entity */
 	buf_addf(b, "{\"name\":\"%s\",\"unique_id\":\"ps5_%s_%s\",\"object_id\":\"ps5_%s\",", e->name, id, e->object,
 	         e->object);
 	if (strcmp(e->component, "sensor") == 0 || strcmp(e->component, "binary_sensor") == 0)
@@ -119,9 +126,13 @@ bool discovery_message(int index, const char* id, const readings* r, const char*
 		for (int i = 0; i < COLOUR_COUNT; i++) buf_addf(b, "%s\"%s\"", i ? "," : "", COLOURS[i].name);
 		buf_addf(b, "],");
 	}
-	buf_addf(b, "\"availability\":[{\"topic\":\"ps5/%s/availability\"}", id);
-	if (e->needs_signal) buf_addf(b, ",{\"topic\":\"ps5/%s/signal\"}", id);
-	buf_addf(b, "],\"availability_mode\":\"all\",%s,", e->members);
+	if (e->keeps_value) {
+		buf_addf(b, "%s,", e->members);
+	} else {
+		buf_addf(b, "\"availability\":[{\"topic\":\"ps5/%s/availability\"}", id);
+		if (e->needs_signal) buf_addf(b, ",{\"topic\":\"ps5/%s/signal\"}", id);
+		buf_addf(b, "],\"availability_mode\":\"all\",%s,", e->members);
+	}
 	buf_addf(b, "\"device\":{\"identifiers\":[\"ps5_%s\"],\"name\":\"PS5\",\"manufacturer\":\"Sony Interactive Entertainment\",", id);
 	buf_addf(b, "\"model\":\"");
 	add_text(b, r->model[0] ? r->model : "PlayStation 5", true);
@@ -162,6 +173,8 @@ void discovery_state(const readings* r, Buf* b)
 	} else {
 		buf_addf(b, "\"game\":null,\"game_id\":null,");
 	}
+	if (r->address[0]) buf_addf(b, "\"ip_address\":\"%s\",", r->address);
+	else buf_addf(b, "\"ip_address\":null,");
 	buf_addf(b, "\"game_running\":%s,\"exporter\":%s,\"signal\":%s}", r->game_running ? "true" : "false",
 	         r->exporter ? "true" : "false", r->signal ? "true" : "false");
 }
@@ -232,6 +245,9 @@ command discovery_command(const char* id, const char* topic, size_t topic_len, c
 		}
 		if (c.text[0] == 0) return c;
 		c.kind = COMMAND_NOTIFY;
+	} else if (ACTION("rest") || ACTION("power_off")) {
+		/* Home Assistant's button sends PRESS; anything else is not a press. */
+		if (payload_len == 5 && memcmp(payload, "PRESS", 5) == 0) c.kind = ACTION("rest") ? COMMAND_REST : COMMAND_POWER_OFF;
 	} else if (ACTION("beep")) {
 		c.kind = COMMAND_BEEP;
 	} else if (ACTION("blink")) {

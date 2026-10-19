@@ -85,6 +85,10 @@ bool config_parse(const char* text, size_t length, config* out, char* error, siz
 			return fail(error, error_size, "interval: 5-300 seconds");
 		c.interval = (int)n->number;
 	}
+	if ((n = json_member(&doc, root, "power_actions")) != NULL) {
+		if (n->type != JSON_BOOL) return fail(error, error_size, "power_actions: true or false");
+		c.power_actions = n->number != 0;
+	}
 	*out = c;
 	return true;
 }
@@ -130,8 +134,10 @@ bool config_save(const config* c, char* error, size_t error_size)
 	const char* temporary = CONFIG_PATH ".new";
 	FILE* f = fopen(temporary, "w");
 	if (f == NULL) return fail(error, error_size, "config.json can't be written");
-	int written = fprintf(f, "{\n  \"host\": %s,\n  \"port\": %d,\n  \"username\": %s,\n  \"password\": %s,\n  \"interval\": %d\n}\n",
-	                      host, c->port, user, pass, c->interval);
+	int written = fprintf(f,
+	                      "{\n  \"host\": %s,\n  \"port\": %d,\n  \"username\": %s,\n  \"password\": %s,\n  \"interval\": %d,\n"
+	                      "  \"power_actions\": %s\n}\n",
+	                      host, c->port, user, pass, c->interval, c->power_actions ? "true" : "false");
 	int closed = fclose(f);
 	if (written < 0 || closed != 0 || rename(temporary, CONFIG_PATH) != 0) {
 		unlink(temporary);
@@ -146,6 +152,6 @@ void config_public_json(const config* c, char* out, size_t cap)
 	char host[300], user[150];
 	json_string(host, sizeof(host), c->host);
 	json_string(user, sizeof(user), c->username);
-	snprintf(out, cap, "{\"host\":%s,\"port\":%d,\"username\":%s,\"password_set\":%s,\"interval\":%d}", host, c->port,
-	         user, c->password[0] ? "true" : "false", c->interval);
+	snprintf(out, cap, "{\"host\":%s,\"port\":%d,\"username\":%s,\"password_set\":%s,\"interval\":%d,\"power_actions\":%s}",
+	         host, c->port, user, c->password[0] ? "true" : "false", c->interval, c->power_actions ? "true" : "false");
 }

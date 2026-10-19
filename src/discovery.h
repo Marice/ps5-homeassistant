@@ -4,7 +4,8 @@
  *   ps5/<id>/availability       online / offline (retained; offline is the last will)
  *   ps5/<id>/signal             online / offline: whether ps5-signal answers (the light and beeper actions)
  *   ps5/<id>/state              one JSON object with every value (retained)
- *   ps5/<id>/command/<action>   notify (text), beep, blink (any payload), colour (a preset name)
+ *   ps5/<id>/command/<action>   notify (text), beep, blink (any payload), colour (a preset name),
+ *                               rest, power_off (PRESS; only while power actions are on)
  *   homeassistant/<component>/ps5_<id>/<object>/config   discovery (retained) */
 #ifndef DISCOVERY_H
 #define DISCOVERY_H
@@ -19,13 +20,22 @@
 
 /* How many discovery messages there are. */
 int discovery_count(void);
-/* Discovery message index: its topic and its JSON config. False past the last one. */
-bool discovery_message(int index, const char* id, const readings* r, const char* version, char* topic, size_t topic_cap,
-                       Buf* payload);
+/* Discovery message index: its topic and its JSON config. False past the last one. The rest mode and power off
+   buttons get an empty payload while power_actions is off: retained, that removes them from Home Assistant. */
+bool discovery_message(int index, const char* id, const readings* r, bool power_actions, const char* version, char* topic,
+                       size_t topic_cap, Buf* payload);
 /* The state message. */
 void discovery_state(const readings* r, Buf* payload);
 
-typedef enum { COMMAND_NONE, COMMAND_NOTIFY, COMMAND_BEEP, COMMAND_BLINK, COMMAND_COLOUR } command_kind;
+typedef enum {
+	COMMAND_NONE,
+	COMMAND_NOTIFY,
+	COMMAND_BEEP,
+	COMMAND_BLINK,
+	COMMAND_COLOUR,
+	COMMAND_REST,
+	COMMAND_POWER_OFF
+} command_kind;
 
 typedef struct {
 	command_kind kind;

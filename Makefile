@@ -12,8 +12,8 @@ ifdef PS5_PAYLOAD_SDK
 endif
 
 CFLAGS := -Wall -Wextra -O2 -std=c11 -D_DEFAULT_SOURCE -DHA_VERSION='"$(VERSION)"'
-LDLIBS := -lkernel_sys -lpthread
-SRCS   := src/main.c src/mqtt.c src/config.c src/json.c src/buf.c src/http.c src/sources.c src/discovery.c
+LDLIBS := -lkernel_sys -lSceSystemService -lpthread
+SRCS   := src/main.c src/mqtt.c src/config.c src/json.c src/buf.c src/http.c src/sources.c src/discovery.c src/power.c
 HDRS   := $(wildcard src/*.h)
 
 HOST_CC ?= gcc

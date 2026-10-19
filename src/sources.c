@@ -30,6 +30,25 @@ static bool is(const char* name, size_t len, const char* want)
 	return strlen(want) == len && strncmp(name, want, len) == 0;
 }
 
+/* Four numbers 0-255 with dots between them. */
+static bool ipv4(const char* text)
+{
+	int parts = 0;
+	const char* p = text;
+	while (*p) {
+		int value = 0, digits = 0;
+		while (*p >= '0' && *p <= '9' && digits < 4) {
+			value = value * 10 + (*p++ - '0');
+			digits++;
+		}
+		if (digits == 0 || digits > 3 || value > 255) return false;
+		parts++;
+		if (*p == '.') p++;
+		else if (*p) return false;
+	}
+	return parts == 4 && p > text && p[-1] != '.';
+}
+
 static void set(reading* r, double v)
 {
 	r->have = true;
@@ -98,6 +117,10 @@ void sources_parse_metrics(const char* text, size_t length, readings* out)
 					} else if (is(line, name_len, "ps5_info")) {
 						label(labels, labels_len, "model", out->model, sizeof(out->model));
 						label(labels, labels_len, "firmware", out->firmware, sizeof(out->firmware));
+					} else if (is(line, name_len, "ps5_network_info") && out->address[0] == 0 &&
+					           label(labels, labels_len, "address", tmp, sizeof(tmp)) && ipv4(tmp) &&
+					           strncmp(tmp, "127.", 4) != 0) {
+						memcpy(out->address, tmp, strlen(tmp) + 1); /* ipv4() allows 15 characters at most */
 					} else if (is(line, name_len, "ps5_exporter_build_info")) {
 						label(labels, labels_len, "version", out->exporter_version, sizeof(out->exporter_version));
 					}

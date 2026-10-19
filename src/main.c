@@ -24,6 +24,7 @@
 #include "discovery.h"
 #include "http.h"
 #include "mqtt.h"
+#include "power.h"
 #include "sources.h"
 
 #ifndef HA_VERSION
@@ -233,14 +234,14 @@ static int publish_text(mqtt* m, const char* t, const char* text, int retain)
 	return mqtt_publish(m, t, text, strlen(text), retain);
 }
 
-static int publish_discovery(mqtt* m, const readings* r)
+static int publish_discovery(mqtt* m, const readings* r, bool power_actions)
 {
 	static char storage[4096];
 	char t[192];
 	for (int i = 0; i < discovery_count(); i++) {
 		Buf b;
 		buf_init(&b, storage, sizeof(storage));
-		if (!discovery_message(i, g_id, r, HA_VERSION, t, sizeof(t), &b) || b.truncated) continue;
+		if (!discovery_message(i, g_id, r, power_actions, HA_VERSION, t, sizeof(t), &b) || b.truncated) continue;
 		if (publish_text(m, t, storage, 1) != 0) return -1;
 	}
 	return 0;
@@ -264,8 +265,38 @@ static long long now_ms(void)
 	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* Rest mode or power off, when allowed: says so on the TV, marks the device offline (the session will not
+   say goodbye from rest mode), then asks the system. */
+static void power_action(const command* c, mqtt* m, const config* conf)
+{
+	static long long last;
+	const char* reason;
+	const bool rest = c->kind == COMMAND_REST;
+	if (!power_allowed(conf->power_actions, last, now_ms(), &reason)) {
+		printf("ps5-homeassistant: %s refused: %s\n", rest ? "rest mode" : "power off", reason);
+		return;
+	}
+	last = now_ms();
+	notify_rich("Home Assistant", rest ? "Rest mode" : "Turning off", access(ICON_PATH, R_OK) == 0 ? ICON_URL : NULL);
+	char will[64];
+	snprintf(will, sizeof(will), "ps5/%s/availability", g_id);
+	publish_text(m, will, "offline", 1);
+	sleep(2); /* the notification shows, and the message leaves */
+	int rc = rest ? power_rest() : power_off();
+	if (rc != 0) {
+		printf("ps5-homeassistant: %s failed: 0x%08x\n", rest ? "rest mode" : "power off", (unsigned)rc);
+		publish_text(m, will, "online", 1);
+		notify(rest ? "ps5-homeassistant: rest mode did not start" : "ps5-homeassistant: the console did not turn off");
+	}
+}
+
+typedef struct {
+	mqtt* m;
+	const config* conf;
+} session_context;
+
 /* Carries out a command. Notifications at most one per 2 seconds; ps5-signal limits the rest itself. */
-static void run(const command* c)
+static void run(const command* c, const session_context* s)
 {
 	static long long last_notify;
 	char answer[512];
@@ -297,6 +328,10 @@ static void run(const command* c)
 		http_request(SIGNAL_PORT, "POST", "/color", body, answer, sizeof(answer), 1000);
 		break;
 	}
+	case COMMAND_REST:
+	case COMMAND_POWER_OFF:
+		power_action(c, s->m, s->conf);
+		break;
 	default:
 		break;
 	}
@@ -306,14 +341,13 @@ static volatile int g_rediscover; /* Home Assistant came back: send discovery ag
 
 static void on_message(const char* t, size_t t_len, const unsigned char* payload, size_t len, void* context)
 {
-	(void)context;
 	static const char status[] = DISCOVERY_PREFIX "/status";
 	if (t_len == sizeof(status) - 1 && memcmp(t, status, t_len) == 0) {
 		if (len == 6 && memcmp(payload, "online", 6) == 0) g_rediscover = 1;
 		return;
 	}
 	command c = discovery_command(g_id, t, t_len, payload, len);
-	run(&c);
+	run(&c, (const session_context*)context);
 }
 
 /* One connection: until it drops, the config changes, or the console slept. Returns 0 when it was used. */
@@ -334,7 +368,8 @@ static int session(const config* c)
 	}
 	readings r;
 	sources_read(&r);
-	if (publish_discovery(&m, &r) != 0 || publish_text(&m, will, "online", 1) != 0 ||
+	session_context context = { &m, c };
+	if (publish_discovery(&m, &r, c->power_actions) != 0 || publish_text(&m, will, "online", 1) != 0 ||
 	    mqtt_subscribe(&m, topic("command/#")) != 0 || mqtt_subscribe(&m, DISCOVERY_PREFIX "/status") != 0 ||
 	    publish_state(&m, &r) != 0) {
 		mqtt_close(&m);
@@ -356,10 +391,10 @@ static int session(const config* c)
 		time_t now = time(NULL);
 		if (now - wall > 5) break;
 		wall = now;
-		if (mqtt_poll(&m, 500, on_message, NULL) != 0) break;
+		if (mqtt_poll(&m, 500, on_message, &context) != 0) break;
 		if (g_rediscover) {
 			g_rediscover = 0;
-			if (publish_discovery(&m, &r) != 0) break;
+			if (publish_discovery(&m, &r, c->power_actions) != 0) break;
 		}
 		if (now_ms() >= next) {
 			sources_read(&r);

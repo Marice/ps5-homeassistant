@@ -10,6 +10,7 @@
 #include "../src/discovery.h"
 #include "../src/json.h"
 #include "../src/mqtt.h"
+#include "../src/power.h"
 #include "../src/sources.h"
 
 static int g_failures;
@@ -100,6 +101,8 @@ static const char METRICS[] =
 	"ps5_game_info{title_id=\"PPSA00001\"} 1\n"
 	"ps5_info{model=\"CFI-7121\",firmware=\"13.60\",system_version=\"13.590.001\"} 1\n"
 	"ps5_exporter_build_info{version=\"0.3.0\"} 1\n"
+	"ps5_network_info{device=\"lo0\",address=\"127.0.0.1\",mac=\"\",mtu=\"16384\"} 1\n"
+	"ps5_network_info{device=\"eth0\",address=\"192.168.68.125\",mac=\"c0:15:1b:cf:c3:91\",mtu=\"1500\"} 1\n"
 	"ps5_shadowmount_game_info{title_id=\"PPSA00002\",name=\"Other\",platform=\"ps5\",source_type=\"image\"} 1\n"
 	"ps5_shadowmount_game_info{title_id=\"PPSA00001\",name=\"A \\\"quoted\\\" game\",platform=\"ps5\",source_type=\"folder\"} 1\n";
 
@@ -120,6 +123,12 @@ static void test_sources(void)
 	                                         strcmp(r.game_name, "A \\\"quoted\\\" game") == 0);
 	ok("metrics: model and firmware", strcmp(r.model, "CFI-7121") == 0 && strcmp(r.firmware, "13.60") == 0);
 	ok("metrics: exporter version", strcmp(r.exporter_version, "0.3.0") == 0);
+	ok("metrics: the network address, not loopback", strcmp(r.address, "192.168.68.125") == 0);
+	memset(&r, 0, sizeof(r));
+	const char* odd = "ps5_network_info{device=\"x\",address=\"999.1.1.1\"} 1\n"
+	                  "ps5_network_info{device=\"y\",address=\"10.0.0\"} 1\n";
+	sources_parse_metrics(odd, strlen(odd), &r);
+	ok("metrics: an address that is not IPv4 is left out", r.address[0] == 0);
 
 	memset(&r, 0, sizeof(r));
 	const char* none = "ps5_game_running 0\nps5_uptime_seconds 10\n";
@@ -152,7 +161,7 @@ static void test_discovery(void)
 	for (int i = 0; i < discovery_count(); i++) {
 		Buf b;
 		buf_init(&b, storage, sizeof(storage));
-		if (!discovery_message(i, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b)) break;
+		if (!discovery_message(i, "aabbccddeeff", &r, true, "0.1.0", topic, sizeof(topic), &b)) break;
 		count++;
 		all_fit &= !b.truncated;
 		/* json.c refuses fractions, which discovery does not use; it checks the structure. */
@@ -166,21 +175,47 @@ static void test_discovery(void)
 	ok("discovery: every message is a JSON object", all_valid);
 	Buf b;
 	buf_init(&b, storage, sizeof(storage));
-	discovery_message(0, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b);
+	discovery_message(0, "aabbccddeeff", &r, true, "0.1.0", topic, sizeof(topic), &b);
 	ok("discovery: topic", strcmp(topic, "homeassistant/sensor/ps5_aabbccddeeff/temperature/config") == 0);
 	ok("discovery: unique id and state topic", strstr(storage, "\"unique_id\":\"ps5_aabbccddeeff_temperature\"") &&
 	                                               strstr(storage, "\"state_topic\":\"ps5/aabbccddeeff/state\""));
 	ok("discovery: device with the model", strstr(storage, "\"model\":\"CFI-7121\"") != NULL);
 
+	/* The power buttons: there with power actions on, an empty (removing) config without; nothing else changes. */
+	int buttons_on = 0, emptied = 0, others_kept = 1;
+	for (int i = 0; i < discovery_count(); i++) {
+		Buf on, off;
+		static char a[4096], z[4096];
+		buf_init(&on, a, sizeof(a));
+		buf_init(&off, z, sizeof(z));
+		discovery_message(i, "aabbccddeeff", &r, true, "0.1.0", topic, sizeof(topic), &on);
+		const int power = strstr(topic, "/rest/config") != NULL || strstr(topic, "/power_off/config") != NULL;
+		discovery_message(i, "aabbccddeeff", &r, false, "0.1.0", topic, sizeof(topic), &off);
+		if (power) {
+			buttons_on += strstr(a, "\"command_topic\":\"ps5/aabbccddeeff/command/") != NULL &&
+			              strstr(a, "\"payload_press\":\"PRESS\"") != NULL;
+			emptied += z[0] == 0;
+		} else if (strcmp(a, z) != 0) {
+			others_kept = 0;
+		}
+		if (strstr(topic, "/ip_address/config"))
+			ok("discovery: the IP address keeps its value (no availability)", strstr(a, "availability") == NULL);
+	}
+	ok("discovery: rest mode and power off buttons with power actions on", buttons_on == 2);
+	ok("discovery: both removed with power actions off", emptied == 2);
+	ok("discovery: the other entities do not depend on it", others_kept);
+
 	buf_init(&b, storage, sizeof(storage));
 	discovery_state(&r, &b);
 	ok("state: valid JSON with the escaped name", strstr(storage, "\"game\":\"A \\\"quoted\\\" game\"") != NULL);
+	ok("state: the IP address", strstr(storage, "\"ip_address\":\"192.168.68.125\"") != NULL);
 	ok("state: values", strstr(storage, "\"power\":220.5") && strstr(storage, "\"gpu_clock\":2150") && strstr(storage, "\"free_space\":179.0"));
 	ok("state: an absent value is null", strstr(storage, "\"signal\":false") && strstr(storage, "\"game_running\":true"));
 	memset(&r, 0, sizeof(r));
 	buf_init(&b, storage, sizeof(storage));
 	discovery_state(&r, &b);
-	ok("state: no readings, all null", strstr(storage, "\"power\":null") && strstr(storage, "\"game\":null"));
+	ok("state: no readings, all null", strstr(storage, "\"power\":null") && strstr(storage, "\"game\":null") &&
+	                                       strstr(storage, "\"ip_address\":null"));
 }
 
 /* -------------------------------------------------------------- commands */
@@ -217,6 +252,15 @@ static void test_commands(void)
 	ok("colour: a preset", c.kind == COMMAND_COLOUR && bl == 255 && w == 80 && a == 200);
 	ok("colour: System is preset 0", cmd("ps5/aabbccddeeff/command/colour", "System").colour == 0);
 	ok("colour: unknown refused", cmd("ps5/aabbccddeeff/command/colour", "Green").kind == COMMAND_NONE);
+	ok("rest mode on PRESS", cmd("ps5/aabbccddeeff/command/rest", "PRESS").kind == COMMAND_REST);
+	ok("power off on PRESS", cmd("ps5/aabbccddeeff/command/power_off", "PRESS").kind == COMMAND_POWER_OFF);
+	ok("rest mode: anything but PRESS refused", cmd("ps5/aabbccddeeff/command/rest", "press").kind == COMMAND_NONE &&
+	                                                cmd("ps5/aabbccddeeff/command/rest", "").kind == COMMAND_NONE &&
+	                                                cmd("ps5/aabbccddeeff/command/power_off", "PRESS!").kind == COMMAND_NONE);
+	const char* why;
+	ok("power: refused while switched off", !power_allowed(false, 0, 50000, &why) && strstr(why, "off") != NULL);
+	ok("power: allowed when on", power_allowed(true, 0, 50000, &why) && why[0] == 0);
+	ok("power: one per 10 seconds", !power_allowed(true, 45000, 50000, &why) && power_allowed(true, 40000, 50000, &why));
 	ok("another console's topic ignored", cmd("ps5/000000000000/command/beep", "PRESS").kind == COMMAND_NONE);
 	ok("unknown action ignored", cmd("ps5/aabbccddeeff/command/reboot", "PRESS").kind == COMMAND_NONE);
 	ok("the prefix alone ignored", cmd("ps5/aabbccddeeff/command/", "x").kind == COMMAND_NONE);
@@ -229,7 +273,7 @@ static void test_config(void)
 	config c;
 	char error[128];
 	config_defaults(&c);
-	ok("config: defaults are not ready", !config_ready(&c) && c.port == 1883 && c.interval == 10);
+	ok("config: defaults are not ready", !config_ready(&c) && c.port == 1883 && c.interval == 10 && !c.power_actions);
 	const char* good = "{\"host\":\"192.168.1.10\",\"username\":\"ps5\",\"password\":\"s3cret!\",\"interval\":15}";
 	ok("config: a valid config", config_parse(good, strlen(good), &c, error, sizeof(error)) && config_ready(&c) &&
 	                                 c.interval == 15 && strcmp(c.password, "s3cret!") == 0);
@@ -240,6 +284,7 @@ static void test_config(void)
 	const char* bad[] = {
 		"{\"host\":\"evil host\"}", "{\"host\":\"\"}", "{\"port\":0}", "{\"port\":70000}", "{\"interval\":1}",
 		"{\"password\":\"with \\\"quote\"}", "{\"username\":5}", "[]", "not json",
+		"{\"power_actions\":1}", "{\"power_actions\":\"true\"}",
 	};
 	int refused = 1;
 	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
@@ -250,12 +295,16 @@ static void test_config(void)
 		}
 	}
 	ok("config: invalid ones refused and nothing changed", refused);
+	const char* power_on = "{\"power_actions\":true}";
+	ok("config: power actions switched on", config_parse(power_on, strlen(power_on), &c, error, sizeof(error)) &&
+	                                           c.power_actions && strcmp(c.password, "s3cret!") == 0);
 	ok("config: save", config_save(&c, error, sizeof(error)));
 	config loaded;
 	ok("config: load what was saved", config_load(&loaded, error, sizeof(error)) && memcmp(&loaded, &c, sizeof(c)) == 0);
 	char text[512];
 	config_public_json(&c, text, sizeof(text));
 	ok("config: the public view hides the password", strstr(text, "s3cret") == NULL && strstr(text, "\"password_set\":true"));
+	ok("config: the public view says whether power actions are on", strstr(text, "\"power_actions\":true") != NULL);
 	remove(CONFIG_PATH);
 }
 
