@@ -5,7 +5,7 @@ JSON.
 
 | Request | Body | Answer |
 | --- | --- | --- |
-| `GET /status` | | `{"service":"ps5-homeassistant","version":"0.1.0","state":"connected","error":""}` |
+| `GET /status` | | `{"service":"ps5-homeassistant","version":"0.2.0","state":"connected","error":""}` |
 | `GET /config` | | `{"host":"...","port":1883,"username":"ps5","password_set":true,"interval":10,"power_actions":false}` |
 | `PUT /config` | any of `host`, `port`, `username`, `password`, `interval`, `power_actions` | the config as `GET /config` shows it, or `400` with `{"error":"..."}` |
 | `POST /quit` | | stops the payload |

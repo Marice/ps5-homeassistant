@@ -116,7 +116,7 @@ For a console with id `<id>` (its MAC address without colons):
 ## Tested
 
 On one console: PS5 Pro (CFI-7121), firmware 13.60, with Home Assistant's Mosquitto add-on. Other firmware: likely,
-not verified.
+not verified. Rest mode (with the device back online after waking) and power off were tested on that console.
 
 ## Building
 
