@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Rest mode and Power off buttons, off by default: switched on with `power_actions` in the config. Each shows a
+  notification first, marks the device offline, and uses the system's own services. One per 10 seconds; only `PRESS`.
+- IP address sensor (diagnostic) that keeps its last value while the console sleeps.
+- README: waking the console from Home Assistant with the Remote Play wake message (a shell command and a script).
+
 ## [v0.1.0] - 2026-10-18
 
 ### Added
