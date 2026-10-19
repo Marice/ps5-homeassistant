@@ -6,7 +6,7 @@ A payload that runs next to [ps5-exporter](https://github.com/Marice/ps5-exporte
 [ps5-signal](https://github.com/Marice/ps5-signal). It publishes the console's values over MQTT, with Home
 Assistant's discovery, so a "PS5" device appears by itself. Home Assistant can send a notification to the TV,
 beep, blink the light or change its colour, and, when you switch it on, put the console in rest mode or turn it
-off. Home Assistant can also wake the console from rest mode (see [Waking the console](#waking-the-console)).
+off.
 
 Other integrations (such as ps5-mqtt) run on a PC and talk to the console over PSN. They know whether it is on and
 what it plays. This one runs on the console: it also reports temperatures, power, the frame rate and the fan, and
@@ -65,54 +65,10 @@ system's own services (`sceSystemStateMgrEnterStandby`, `sceSystemStateMgrTurnOf
 
 ## Waking the console
 
-The payload cannot wake the console: in rest mode it sleeps too. Home Assistant wakes it with the same message the
-Remote Play apps send (one UDP datagram to port 9302, as [playactor](https://github.com/dhleong/playactor) does).
-This works from rest mode only, not after a power off.
-
-**On the console, once:**
-
-- Settings, System, Remote Play: turn on Remote Play.
-- Settings, System, Power Saving, Features Available in Rest Mode: turn on **Stay Connected to the Internet** and
-  **Enable Turning On PS5 from Network**.
-
-**Get the wake credential, once,** with playactor on a PC that has Node.js:
-
-1. Run `npx playactor login` and follow its steps: a PlayStation login in the browser, then, on the PS5,
-   Settings, System, Remote Play, **Link Device**, and type the code it shows.
-2. Open `~/.config/playactor/credentials.json`. Under your console, copy the value of `user-credential` (a long
-   number). It is a secret: do not share it or put it in a screenshot.
-
-**In Home Assistant,** add to `secrets.yaml`:
-
-```yaml
-ps5_wake_credential: "1234567890123456789"
-```
-
-and to `configuration.yaml` (then restart Home Assistant):
-
-```yaml
-shell_command:
-  ps5_wake: >-
-    python3 -c "import socket, sys;
-    m = 'WAKEUP * HTTP/1.1\napp-type:r\nauth-type:R\nclient-type:vr\nmodel:w\nuser-credential:' + sys.argv[2]
-    + '\ndevice-discovery-protocol-version:00030010\n';
-    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(m.encode(), (sys.argv[1], 9302))"
-    {{ host }} {{ credential }}
-
-script:
-  ps5_wake:
-    alias: Wake the PS5
-    icon: mdi:power
-    sequence:
-      - action: shell_command.ps5_wake
-        data:
-          host: "{{ states('sensor.ps5_ip_address') }}"
-          credential: !secret ps5_wake_credential
-```
-
-Run the script `script.ps5_wake` (or put it on a dashboard). The console wakes within seconds, and the device comes
-back online when ps5-homeassistant reconnects. The IP address sensor keeps the console's last address while it
-sleeps; with a fixed address you can type it instead.
+Not possible from Home Assistant on a jailbroken console. The payload sleeps in rest mode too, and Sony's network
+wake needs a Remote Play pairing, which needs the console online with a PSN account. Tested on 13.60: a wake message
+without a pairing did not wake the console, also with Remote Play switched on in the registry. Wake it with the
+controller, or with your TV over HDMI-CEC.
 
 ## Installing
 
@@ -139,7 +95,6 @@ The device appears in Home Assistant under Settings, Devices and services, MQTT,
 - **Commands** come from anyone who may publish on the broker: give the console's user its own password. Messages
   are checked (length, UTF-8, known colours), and ps5-signal limits beeps and light changes.
 - **Power actions** are off unless you switch them on, take only `PRESS`, and run at most once per 10 seconds.
-- **The wake credential** lets anyone on your network wake the console. Keep it in `secrets.yaml`.
 
 ## Topics
 
