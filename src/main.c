@@ -415,8 +415,14 @@ static int session(const config* c)
 	return 0;
 }
 
+/* In libkernel. The ELF loader names a payload sent to it "payload.elf"; this name is what process lists
+   (pldmgr, PayLoader) show instead. At most 19 characters, ending in ".elf" so they count it as a payload, hence
+   not "ps5-homeassistant.elf". */
+int sceKernelSetProcessName(const char* name);
+
 int main(void)
 {
+	sceKernelSetProcessName("ps5-hass.elf");
 	signal(SIGPIPE, SIG_IGN);
 	console_id();
 	char error[128];
