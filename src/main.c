@@ -255,6 +255,9 @@ static int publish_state(mqtt* m, const readings* r)
 	discovery_state(r, &b);
 	if (b.truncated) return 0;
 	if (publish_text(m, topic("state"), storage, 1) != 0) return -1;
+	/* online again with every state: an "offline" that arrived late (the broker's last will for a connection
+	   that rest mode broke, or the one sent before a power action) is undone within one interval. */
+	if (publish_text(m, topic("availability"), "online", 1) != 0) return -1;
 	return publish_text(m, topic("signal"), r->signal ? "online" : "offline", 1);
 }
 
