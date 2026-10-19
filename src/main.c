@@ -265,7 +265,7 @@ static long long now_ms(void)
 	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Rest mode or power off, when allowed: says so on the TV, marks the device offline (the session will not
+/* Rest mode or power off, when allowed: beeps, says so on the TV, marks the device offline (the session will not
    say goodbye from rest mode), then asks the system. */
 static void power_action(const command* c, mqtt* m, const config* conf)
 {
@@ -277,6 +277,9 @@ static void power_action(const command* c, mqtt* m, const config* conf)
 		return;
 	}
 	last = now_ms();
+	/* A beep first, as for a notification, so it is heard even with the TV off (when ps5-signal runs). */
+	char answer[256];
+	http_request(SIGNAL_PORT, "POST", "/beep", "{\"pattern\":[{\"tone\":1}]}", answer, sizeof(answer), 1000);
 	notify_rich("Home Assistant", rest ? "Rest mode" : "Turning off", access(ICON_PATH, R_OK) == 0 ? ICON_URL : NULL);
 	char will[64];
 	snprintf(will, sizeof(will), "ps5/%s/availability", g_id);

@@ -60,7 +60,7 @@ Two buttons then appear on the device:
 - **Power off** turns the console off. **This ends the jailbreak:** nothing of the homebrew runs until you start the
   exploit again.
 
-The console shows a notification first ("Rest mode", "Turning off"). One power action per 10 seconds. Both use the
+The console beeps (when ps5-signal runs) and shows a notification first ("Rest mode", "Turning off"). One power action per 10 seconds. Both use the
 system's own services (`sceSystemStateMgrEnterStandby`, `sceSystemStateMgrTurnOff`), not a raw reboot call.
 
 ## Waking the console

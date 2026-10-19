@@ -8,7 +8,7 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 - Rest mode and Power off buttons, off by default: switched on with `power_actions` in the config. Each shows a
-  notification first, marks the device offline, and uses the system's own services. One per 10 seconds; only `PRESS`.
+  beep (with ps5-signal) and a notification first, marks the device offline, and uses the system's own services. One per 10 seconds; only `PRESS`.
 - IP address sensor (diagnostic) that keeps its last value while the console sleeps.
 
 ## [v0.1.0] - 2026-10-18
