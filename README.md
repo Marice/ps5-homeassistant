@@ -58,7 +58,7 @@ Two buttons then appear on the device:
 - **Rest mode** puts the console in rest mode, as its power menu does. The payloads keep running; Home Assistant
   shows the device as unavailable until the console wakes.
 - **Power off** turns the console off. **This ends the jailbreak:** nothing of the homebrew runs until you start the
-  exploit again, and Home Assistant cannot wake the console.
+  exploit again.
 
 The console shows a notification first ("Rest mode", "Turning off"). One power action per 10 seconds. Both use the
 system's own services (`sceSystemStateMgrEnterStandby`, `sceSystemStateMgrTurnOff`), not a raw reboot call.
