@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.0] - 2026-10-23
+
+### Added
+- Live events: four event entities for automations. Trophy (`bronze`, `silver`, `gold`, `platinum`) and Download
+  (`installed`, `ready`, `addon_ready`, `update_added`, `other`) come from the console's notification list, read from
+  a copy every 2 seconds and never locked or written. Game started or stopped comes from ps5-exporter. Storage job
+  (`completed`, `failed`, `cancelled`) comes from ShadowMountPlus' copy, move, unpack and delete jobs. Nothing fires
+  for what happened before the payload started, or for events older than 10 minutes after a lost connection.
+- A trophy event also names the game that runs (`title_id`, `game`), from ps5-exporter's last reading.
+- Free space of the extended storage (`/mnt/ext1`) and the first USB drive (`/mnt/usb0`).
+- A diagnostic sensor per payload in ps5-autoloader's boot chain, and a Start button for each payload that is not
+  running (not for etaHEN, kstuff or ps5-homeassistant itself).
+- Start a game from Home Assistant: a select with every title ShadowMountPlus lists, and a Start game button. It
+  refuses while a game runs.
+- `GET /status` on the local API has an `events` field: empty, or why the live events are not read.
+
+### Changed
+- The payload bundles SQLite 3.46.1 (public domain) to read the notification list. The ELF grows from 168 KB to
+  about 1.07 MB.
+
 ## [v0.2.1] - 2026-10-19
 
 ### Changed

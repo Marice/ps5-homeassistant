@@ -1,4 +1,4 @@
-/* Host tests: MQTT packets, the metrics subset, the discovery messages, commands and the config.
+/* Host tests: MQTT packets, the metrics subset, the discovery messages, commands, the config and live events.
  * Built by `make test` with AddressSanitizer and UBSan; no console or broker needed. */
 #include <stdint.h>
 #include <stdio.h>
@@ -6,12 +6,18 @@
 #include <string.h>
 
 #include "../src/buf.h"
+#include "../src/chain.h"
 #include "../src/config.h"
 #include "../src/discovery.h"
+#include "../src/events.h"
 #include "../src/json.h"
 #include "../src/mqtt.h"
+#include "../src/notifications.h"
 #include "../src/power.h"
 #include "../src/sources.h"
+#include "../third_party/sqlite/sqlite3.h"
+
+#include <unistd.h>
 
 static int g_failures;
 
@@ -95,7 +101,7 @@ static const char METRICS[] =
 	"ps5_soc_clock_hertz{domain=\"20\",name=\"gpu\"} 2150000000\n"
 	"ps5_fps 59.9\n"
 	"ps5_uptime_seconds 3600\n"
-	"ps5_filesystem_avail_bytes{mountpoint=\"/mnt/usb0\",fstype=\"exfatfs\"} 1\n"
+	"ps5_filesystem_avail_bytes{mountpoint=\"/mnt/usb0\",fstype=\"exfatfs\"} 439337484288\n"
 	"ps5_filesystem_avail_bytes{mountpoint=\"/user\",fstype=\"ufs\"} 179000000000\n"
 	"ps5_game_running 1\n"
 	"ps5_game_info{title_id=\"PPSA00001\"} 1\n"
@@ -118,7 +124,8 @@ static void test_sources(void)
 	ok("metrics: CPU load is the average in percent", r.cpu_load.have && r.cpu_load.value == 50.0);
 	ok("metrics: GPU clock in MHz", r.gpu_clock.have && r.gpu_clock.value == 2150.0);
 	ok("metrics: fps", r.fps.have && r.fps.value > 59.8);
-	ok("metrics: free space on /user only", r.free_space.have && r.free_space.value == 179000000000.0);
+	ok("metrics: free space on /user", r.free_space.have && r.free_space.value == 179000000000.0);
+	ok("metrics: free space on USB; no extended storage", r.free_usb.have && r.free_usb.value == 439337484288.0 && !r.free_ext.have);
 	ok("metrics: the game and its name", r.game_running && strcmp(r.game_id, "PPSA00001") == 0 &&
 	                                         strcmp(r.game_name, "A \\\"quoted\\\" game") == 0);
 	ok("metrics: model and firmware", strcmp(r.model, "CFI-7121") == 0 && strcmp(r.firmware, "13.60") == 0);
@@ -205,11 +212,25 @@ static void test_discovery(void)
 	ok("discovery: both removed with power actions off", emptied == 2);
 	ok("discovery: the other entities do not depend on it", others_kept);
 
+	int events_found = 0;
+	for (int i = 0; i < discovery_count(); i++) {
+		buf_init(&b, storage, sizeof(storage));
+		discovery_message(i, "aabbccddeeff", &r, true, "0.1.0", topic, sizeof(topic), &b);
+		if (strcmp(topic, "homeassistant/event/ps5_aabbccddeeff/trophy/config") == 0)
+			ok("discovery: the trophy event's topic and grades",
+			   strstr(storage, "\"state_topic\":\"ps5/aabbccddeeff/event/trophy\"") &&
+			       strstr(storage, "\"event_types\":[\"bronze\",\"silver\",\"gold\",\"platinum\"]") &&
+			       strstr(storage, "command_topic") == NULL);
+		events_found += strncmp(topic, "homeassistant/event/", 20) == 0;
+	}
+	ok("discovery: four event entities", events_found == 4);
+
 	buf_init(&b, storage, sizeof(storage));
 	discovery_state(&r, &b);
 	ok("state: valid JSON with the escaped name", strstr(storage, "\"game\":\"A \\\"quoted\\\" game\"") != NULL);
 	ok("state: the IP address", strstr(storage, "\"ip_address\":\"192.168.68.125\"") != NULL);
-	ok("state: values", strstr(storage, "\"power\":220.5") && strstr(storage, "\"gpu_clock\":2150") && strstr(storage, "\"free_space\":179.0"));
+	ok("state: values", strstr(storage, "\"power\":220.5") && strstr(storage, "\"gpu_clock\":2150") && strstr(storage, "\"free_space\":179.0") &&
+	                         strstr(storage, "\"free_usb\":439.3") && strstr(storage, "\"free_ext\":null"));
 	ok("state: an absent value is null", strstr(storage, "\"signal\":false") && strstr(storage, "\"game_running\":true"));
 	memset(&r, 0, sizeof(r));
 	buf_init(&b, storage, sizeof(storage));
@@ -308,6 +329,340 @@ static void test_config(void)
 	remove(CONFIG_PATH);
 }
 
+/* ---------------------------------------------------------------- events */
+
+static notification_row row(long long id, long long updated_ms, const char* channel, const char* use_case)
+{
+	notification_row n;
+	memset(&n, 0, sizeof(n));
+	n.id = id;
+	n.updated_ms = updated_ms;
+	snprintf(n.channel, sizeof(n.channel), "%s", channel);
+	snprintf(n.use_case, sizeof(n.use_case), "%s", use_case);
+	return n;
+}
+
+static notification_row trophy_row(long long id, long long updated_ms, const char* grade, const char* name)
+{
+	notification_row n = row(id, updated_ms, "Trophies", "NUC55");
+	snprintf(n.grade, sizeof(n.grade), "%s", grade);
+	snprintf(n.trophy_name, sizeof(n.trophy_name), "%s", name);
+	snprintf(n.trophy_id, sizeof(n.trophy_id), "7");
+	snprintf(n.np_comm_id, sizeof(n.np_comm_id), "NPWR00001_00");
+	return n;
+}
+
+static void test_events(void)
+{
+	const long long now = 1800000000000LL;
+	event_state s;
+	events_init(&s);
+	console_event out[8];
+
+	notification_row old[] = { trophy_row(10, now - 1000, "Bronze", "Old one"), row(11, now - 500, "Downloads", "NUC240") };
+	ok("events: the baseline sends nothing", events_from_notifications(&s, old, 2, now, out, 8) == 0);
+	ok("events: the baseline sets the cursor", s.last_id == 11 && s.last_updated_ms == now - 500);
+	ok("events: rows seen before send nothing", events_from_notifications(&s, old, 2, now, out, 8) == 0);
+
+	notification_row gold = trophy_row(12, now - 100, "Gold", "A \"quoted\" trophy");
+	int n = events_from_notifications(&s, &gold, 1, now, out, 8);
+	ok("events: a new gold trophy", n == 1 && strcmp(out[0].object, "trophy") == 0 &&
+	                                    strstr(out[0].payload, "\"event_type\":\"gold\"") != NULL);
+	ok("events: the trophy's name escaped, id and set", strstr(out[0].payload, "\"trophy\":\"A \\\"quoted\\\" trophy\"") &&
+	                                                         strstr(out[0].payload, "\"trophy_id\":\"7\"") &&
+	                                                         strstr(out[0].payload, "\"trophy_set\":\"NPWR00001_00\""));
+	ok("events: the payload is a JSON object", valid_json(out[0].payload));
+
+	notification_row mixed[5];
+	mixed[0] = row(13, now - 90, "Downloads", "IDC"); /* a homebrew notification, ours included */
+	mixed[1] = row(14, now - 80, "Downloads", "NUC240");
+	snprintf(mixed[1].title_id, sizeof(mixed[1].title_id), "PPSA00002");
+	snprintf(mixed[1].message, sizeof(mixed[1].message), "Installed.");
+	mixed[2] = row(15, now - EVENTS_MAX_AGE_MS - 1, "Downloads", "NUC246"); /* too old after an outage */
+	mixed[3] = row(16, now - 70, "SystemFeedback", "NUC411");
+	mixed[4] = trophy_row(17, now - 60, "Diamond", "Unknown grade");
+	n = events_from_notifications(&s, mixed, 5, now, out, 8);
+	ok("events: only the install is sent", n == 1 && strcmp(out[0].object, "download") == 0 &&
+	                                           strstr(out[0].payload, "\"event_type\":\"installed\"") &&
+	                                           strstr(out[0].payload, "\"title_id\":\"PPSA00002\"") &&
+	                                           strstr(out[0].payload, "\"message\":\"Installed.\""));
+	ok("events: the cursor passes every row, sent or not", s.last_id == 17);
+	ok("events: an unknown trophy grade is noted", strstr(s.skipped, "Diamond") != NULL);
+	notification_row other = row(18, now, "Downloads", "NUC999");
+	n = events_from_notifications(&s, &other, 1, now, out, 8);
+	ok("events: an unknown download kind is other", n == 1 && strstr(out[0].payload, "\"event_type\":\"other\""));
+
+	/* Games, from ps5-exporter's readings. */
+	readings r;
+	memset(&r, 0, sizeof(r));
+	ok("game: no exporter, no baseline", events_from_reading(&s, &r, out, 8) == 0 && !s.game_seen);
+	r.exporter = true;
+	r.game_running = true;
+	snprintf(r.game_id, sizeof(r.game_id), "PPSA00001");
+	snprintf(r.game_name, sizeof(r.game_name), "First");
+	ok("game: the baseline sends nothing", events_from_reading(&s, &r, out, 8) == 0);
+	ok("game: the same game sends nothing", events_from_reading(&s, &r, out, 8) == 0);
+	readings gone = r;
+	gone.exporter = false;
+	gone.game_running = false;
+	gone.game_id[0] = 0;
+	ok("game: the exporter missing is not a stop", events_from_reading(&s, &gone, out, 8) == 0 &&
+	                                                    strcmp(s.game_id, "PPSA00001") == 0);
+	snprintf(r.game_id, sizeof(r.game_id), "PPSA00002");
+	snprintf(r.game_name, sizeof(r.game_name), "Second");
+	n = events_from_reading(&s, &r, out, 8);
+	ok("game: a switch is a stop and a start", n == 2 && strstr(out[0].payload, "\"event_type\":\"stopped\"") &&
+	                                                strstr(out[0].payload, "\"game\":\"First\"") &&
+	                                                strstr(out[1].payload, "\"event_type\":\"started\"") &&
+	                                                strstr(out[1].payload, "\"title_id\":\"PPSA00002\""));
+	r.game_running = false;
+	n = events_from_reading(&s, &r, out, 8);
+	ok("game: quitting is a stop", n == 1 && strstr(out[0].payload, "\"stopped\"") && strstr(out[0].payload, "Second"));
+
+	/* A trophy names the game that runs; without a game, only the trophy set. */
+	r.game_running = true;
+	snprintf(r.game_id, sizeof(r.game_id), "PPSA00003");
+	snprintf(r.game_name, sizeof(r.game_name), "Third");
+	events_from_reading(&s, &r, out, 8);
+	notification_row during = trophy_row(30, now - 10, "Bronze", "In game");
+	n = events_from_notifications(&s, &during, 1, now, out, 8);
+	ok("trophy: the running game's title ID and name", n == 1 && strstr(out[0].payload, "\"title_id\":\"PPSA00003\"") &&
+	                                                       strstr(out[0].payload, "\"game\":\"Third\""));
+	r.game_running = false;
+	events_from_reading(&s, &r, out, 8);
+	notification_row after = trophy_row(31, now - 5, "Silver", "No game");
+	n = events_from_notifications(&s, &after, 1, now, out, 8);
+	ok("trophy: no game running, no game fields", n == 1 && strstr(out[0].payload, "title_id") == NULL &&
+	                                                  strstr(out[0].payload, "\"game\"") == NULL);
+
+	/* ShadowMountPlus' storage jobs. */
+	storage_status st;
+	memset(&st, 0, sizeof(st));
+	ok("storage: no answer, nothing", events_from_storage(&s, &st, out, 8) == 0 && !s.storage_seen);
+	st.have = true;
+	st.job_id = 3;
+	snprintf(st.state, sizeof(st.state), "completed");
+	ok("storage: a job that ended before the baseline is not sent", events_from_storage(&s, &st, out, 8) == 0);
+	st.job_id = 4;
+	snprintf(st.state, sizeof(st.state), "transferring");
+	ok("storage: a running job sends nothing", events_from_storage(&s, &st, out, 8) == 0);
+	snprintf(st.state, sizeof(st.state), "completed");
+	snprintf(st.operation, sizeof(st.operation), "copy");
+	snprintf(st.destination, sizeof(st.destination), "/mnt/usb0/data/etaHEN/games/PPSA00001 A.ffpfsc");
+	n = events_from_storage(&s, &st, out, 8);
+	ok("storage: a finished copy", n == 1 && strcmp(out[0].object, "storage") == 0 &&
+	                                   strstr(out[0].payload, "\"event_type\":\"completed\"") &&
+	                                   strstr(out[0].payload, "\"operation\":\"copy\"") &&
+	                                   strstr(out[0].payload, "\"destination\":\"/mnt/usb0/data/etaHEN/games/PPSA00001 A.ffpfsc\""));
+	ok("storage: sent once", events_from_storage(&s, &st, out, 8) == 0);
+	st.job_id = 5;
+	snprintf(st.state, sizeof(st.state), "failed");
+	snprintf(st.error, sizeof(st.error), "a game is active");
+	n = events_from_storage(&s, &st, out, 8);
+	ok("storage: a failed job with its error", n == 1 && strstr(out[0].payload, "\"failed\"") &&
+	                                               strstr(out[0].payload, "\"error\":\"a game is active\""));
+	event_state fresh;
+	events_init(&fresh);
+	st.job_id = 7;
+	snprintf(st.state, sizeof(st.state), "transferring");
+	events_from_storage(&fresh, &st, out, 8);
+	snprintf(st.state, sizeof(st.state), "cancelled");
+	ok("storage: a job running at the baseline is sent when it ends", events_from_storage(&fresh, &st, out, 8) == 1);
+
+	const char* answer =
+		"{\"status\":0,\"job_id\":2,\"operation\":\"copy\",\"state\":\"completed\",\"active\":false,"
+		"\"title_id\":\"PPSA02225\",\"destination\":\"\\/mnt\\/usb0\\/data\\/etaHEN\\/games\\/PPSA02225 GOT.ffpfsc\","
+		"\"progress_percent\":100.0,\"result_status\":0,\"result_error\":\"\"}";
+	sources_parse_storage(answer, &st);
+	ok("storage: ShadowMountPlus' answer, fractions and escaped slashes",
+	   st.have && st.job_id == 2 && strcmp(st.state, "completed") == 0 && strcmp(st.operation, "copy") == 0 &&
+	       strcmp(st.title_id, "PPSA02225") == 0 &&
+	       strcmp(st.destination, "/mnt/usb0/data/etaHEN/games/PPSA02225 GOT.ffpfsc") == 0 && st.error[0] == 0);
+	sources_parse_storage("{\"status\":2,\"error\":\"storage job not found\"}", &st);
+	ok("storage: no job yet", !st.have);
+	sources_parse_storage("not json", &st);
+	ok("storage: garbage", !st.have);
+}
+
+/* --------------------------------------------------------- notifications */
+
+#define TEST_DB "build/notification-test.db"
+
+/* The schema of the system's notification2.db (decision log D9); the rows are made up. */
+static void db_exec(const char* sql)
+{
+	sqlite3* db;
+	sqlite3_open(TEST_DB, &db);
+	sqlite3_exec(db, sql, NULL, NULL, NULL);
+	sqlite3_close(db);
+}
+
+static void test_notifications(void)
+{
+	remove(TEST_DB);
+	db_exec("CREATE TABLE notification(    id INTEGER PRIMARY KEY AUTOINCREMENT,    user_id INTEGER DEFAULT -1,"
+	        "    originator INTEGER NOT NULL,    is_popped_up INTEGER DEFAULT 0,    server_sync_state INTEGER,"
+	        "    notification_id TEXT,    local_notification_id TEXT,    bundle_name TEXT,    state TEXT NOT NULL,"
+	        "    created_date_time INTEGER NOT NULL,    updated_date_time INTEGER NOT NULL,"
+	        "    expiration_date_time INTEGER,    raw_data TEXT NOT NULL,    upload_data TEXT,    cached_data TEXT,"
+	        "    extra_data TEXT );"
+	        "INSERT INTO notification(id, originator, bundle_name, state, created_date_time, updated_date_time, raw_data)"
+	        " VALUES (20, 0, 'local:Trophy', 'New', 1000, 1000,"
+	        " '{\"channelType\":\"Trophies\",\"useCaseId\":\"NUC55\",\"telemetryData\":{\"parameters\":"
+	        "{\"isTrophyAttained\":true,\"trophyGrade\":\"Silver\",\"trophyId\":\"3\",\"trophyName\":\"Made up\","
+	        "\"trophyNpCommId\":\"NPWR00001_00\"}},\"viewData\":{\"message\":{\"body\":\" Made up\"}}}'),"
+	        " (21, 0, NULL, 'New', 2000, 2000,"
+	        " '{\"channelType\":\"Downloads\",\"useCaseId\":\"NUC240\",\"viewData\":{\"icon\":{\"parameters\":"
+	        "{\"npTitleIds\":[\"PPSA00009_00\"]},\"type\":\"TitleByTitle\"},\"message\":{\"body\":\"Installed.\"}}}'),"
+	        " (22, 0, NULL, 'New', 3000, 3000, 'not json'),"
+	        " (23, 0, NULL, 'New', 4000, 4000,"
+	        " '{\"channelType\":\"Downloads\",\"useCaseId\":\"IDC\",\"viewData\":{\"message\":{\"body\":\"etaHEN\"}}}');");
+
+	notifications_reader reader;
+	notifications_init(&reader, TEST_DB);
+	static notification_row rows[NOTIFICATIONS_MAX_ROWS];
+	int count = 0;
+	char error[128];
+	notifications_result result = notifications_poll(&reader, 0, 0, rows, &count, error, sizeof(error));
+	ok("notifications: read from a copy", result == NOTIFICATIONS_READ);
+	ok("notifications: valid rows, oldest first, bad JSON skipped",
+	   count == 3 && rows[0].id == 20 && rows[1].id == 21 && rows[2].id == 23);
+	ok("notifications: the trophy's fields", strcmp(rows[0].channel, "Trophies") == 0 && strcmp(rows[0].grade, "Silver") == 0 &&
+	                                             strcmp(rows[0].trophy_name, "Made up") == 0 &&
+	                                             strcmp(rows[0].trophy_id, "3") == 0 &&
+	                                             strcmp(rows[0].np_comm_id, "NPWR00001_00") == 0);
+	ok("notifications: the title ID without _00, and the message",
+	   strcmp(rows[1].title_id, "PPSA00009") == 0 && strcmp(rows[1].message, "Installed.") == 0 && rows[1].updated_ms == 2000);
+	ok("notifications: an unchanged file is not read again",
+	   notifications_poll(&reader, 23, 4000, rows, &count, error, sizeof(error)) == NOTIFICATIONS_UNCHANGED);
+
+	usleep(20000); /* a later modification time */
+	db_exec("INSERT INTO notification(id, originator, state, created_date_time, updated_date_time, raw_data)"
+	        " VALUES (24, 0, 'New', 5000, 5000, '{\"channelType\":\"Trophies\",\"telemetryData\":"
+	        "{\"parameters\":{\"trophyGrade\":\"Platinum\"}}}');");
+	result = notifications_poll(&reader, 23, 4000, rows, &count, error, sizeof(error));
+	ok("notifications: only the new row after a change", result == NOTIFICATIONS_READ && count == 1 && rows[0].id == 24 &&
+	                                                         strcmp(rows[0].grade, "Platinum") == 0);
+
+	FILE* f = fopen(TEST_DB, "w");
+	if (f) {
+		fputs("this is not a database", f);
+		fclose(f);
+	}
+	result = notifications_poll(&reader, 24, 5000, rows, &count, error, sizeof(error));
+	ok("notifications: a file that is not SQLite is an error", result == NOTIFICATIONS_ERROR && error[0] != 0);
+	ok("notifications: and is not tried again until it changes",
+	   notifications_poll(&reader, 24, 5000, rows, &count, error, sizeof(error)) == NOTIFICATIONS_UNCHANGED);
+	remove(TEST_DB);
+	notifications_init(&reader, TEST_DB);
+	ok("notifications: a missing file is an error",
+	   notifications_poll(&reader, 0, 0, rows, &count, error, sizeof(error)) == NOTIFICATIONS_ERROR);
+}
+
+/* ------------------------------------------------------- boot chain */
+
+static void test_chain(void)
+{
+	char key[32];
+	chain_key("shadowmountplus_1.7beta5.elf", key, sizeof(key));
+	ok("chain: key cut at '_'", strcmp(key, "shadowmountplus") == 0);
+	chain_key("/data/x/etaHEN-13.60.elf", key, sizeof(key));
+	ok("chain: key cut at '-' and a digit, lower case", strcmp(key, "etahen") == 0);
+	chain_key("websrv-v0.34.elf", key, sizeof(key));
+	ok("chain: key cut at '-v' and a digit", strcmp(key, "websrv") == 0);
+	chain_key("ps5-exporter.elf", key, sizeof(key));
+	ok("chain: a '-' between words stays", strcmp(key, "ps5-exporter") == 0);
+
+	/* Marice's chain and process names on 23 October 2026 (decision log D14). */
+	const char* list = "nanodns.elf\n!1500\netaHEN-13.60.elf\n!12500\r\nshadowmountplus_1.7beta5.elf # mounts\n!2000\n"
+	                   "ps5-exporter.elf\n!1500\nps5-homeassistant.elf\n@sync\n# ps5-signal-old.elf\n\n"
+	                   "/data/elsewhere/ps5-signal.elf\nps5-exporter.elf\n";
+	chain_payload chain[CHAIN_MAX];
+	int count = chain_parse(list, strlen(list), "/data/ps5_autoloader", chain, CHAIN_MAX);
+	ok("chain: six payloads; sleeps, directives, comments and a repeat skipped", count == 6);
+	ok("chain: relative and absolute paths", strcmp(chain[0].path, "/data/ps5_autoloader/nanodns.elf") == 0 &&
+	                                             strcmp(chain[5].path, "/data/elsewhere/ps5-signal.elf") == 0);
+	ok("chain: a comment after a name", strcmp(chain[2].key, "shadowmountplus") == 0 &&
+	                                        strcmp(chain[2].name, "shadowmountplus_1.7beta5") == 0);
+	ok("chain: object ids", strcmp(chain[3].object, "payload_ps5_exporter") == 0);
+	ok("chain: no start for etaHEN or itself", !chain[1].can_start && !chain[4].can_start && chain[0].can_start &&
+	                                               chain[2].can_start && chain[3].can_start && chain[5].can_start);
+	static const char processes[][20] = { "kernel",           "elfldr.elf",       "etaHEN Critical ser", "nanodns.elf",
+	                                      "shadowmountplus.elf", "ps5-exporter.elf", "ps5-hass.elf",        "eboot.bin" };
+	const int n = (int)(sizeof(processes) / sizeof(processes[0]));
+	int all = 1;
+	for (int i = 0; i < 5; i++) all &= chain_running(&chain[i], processes, n) == 1;
+	ok("chain: each running payload found by its process", all);
+	ok("chain: ps5-signal not running", chain_running(&chain[5], processes, n) == 0);
+	ok("chain: no process table is unknown", chain_running(&chain[0], processes, 0) == -1);
+	static const char lookalike[][20] = { "nanodnsx.elf", "ps5-exporter-dev" };
+	ok("chain: a longer name is another payload", chain_running(&chain[0], lookalike, 2) == 0);
+	ok("chain: a '-' suffix still belongs", chain_running(&chain[3], lookalike, 2) == 1);
+
+	readings r;
+	memset(&r, 0, sizeof(r));
+	static char storage[24 * 1024];
+	char topic[192];
+	Buf b;
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: a payload's status sensor",
+	   discovery_payload_message(&chain[2], DISCOVERY_PAYLOAD_STATUS, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b) &&
+	       strcmp(topic, "homeassistant/binary_sensor/ps5_aabbccddeeff/payload_shadowmountplus/config") == 0 &&
+	       strstr(storage, "\"value_template\":\"{{ value_json.payload_shadowmountplus }}\"") && valid_json(storage));
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: a payload's start button",
+	   discovery_payload_message(&chain[2], DISCOVERY_PAYLOAD_START, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b) &&
+	       strcmp(topic, "homeassistant/button/ps5_aabbccddeeff/start_payload_shadowmountplus/config") == 0 &&
+	       strstr(storage, "\"command_topic\":\"ps5/aabbccddeeff/command/start/payload_shadowmountplus\"") &&
+	       strstr(storage, "\"name\":\"Start shadowmountplus_1.7beta5\"") && valid_json(storage));
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: no start button for etaHEN",
+	   !discovery_payload_message(&chain[1], DISCOVERY_PAYLOAD_START, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b));
+	int running[3] = { 1, 0, -1 };
+	buf_init(&b, storage, sizeof(storage));
+	discovery_payload_state(chain, running, 3, &b);
+	ok("state: payloads true, false and unknown",
+	   strcmp(storage, "{\"payload_nanodns\":true,\"payload_etahen\":false,\"payload_shadowmountplus\":null}") == 0);
+
+	/* The game list, as ShadowMountPlus answers (shortened; fractions and escapes as it sends them). */
+	const char* answer =
+		"{\"status\":0,\"games\":[{\"title_id\":\"PPSA17221\",\"title_name\":\"Minecraft\",\"size\":0.5},"
+		"{\"title_id\":\"PPSA21904\",\"title_name\":\"\\u5f9e\\u524d\"},{\"title_id\":\"PPSA02225\",\"title_name\":\"Ghost of \\\"T\\\"\"},"
+		"{\"title_id\":\"PPSA99000\"},{\"title_name\":\"no id\"}]}";
+	game_entry games[GAMES_MAX];
+	int games_count = sources_parse_games(answer, games, GAMES_MAX);
+	ok("games: titles with an id, sorted by name", games_count == 4 && strcmp(games[0].title_id, "PPSA02225") == 0 &&
+	                                                   strcmp(games[1].title_id, "PPSA17221") == 0);
+	ok("games: a missing name is the id; escapes decoded",
+	   strcmp(games[2].name, "PPSA99000") == 0 && strcmp(games[0].name, "Ghost of \"T\"") == 0 &&
+	       strcmp(games[3].name, "\xe5\xbe\x9e\xe5\x89\x8d") == 0);
+	ok("games: an error answer is no list", sources_parse_games("{\"status\":2,\"error\":\"x\"}", games, GAMES_MAX) == -1);
+	ok("games: garbage is no list", sources_parse_games("<html>", games, GAMES_MAX) == -1);
+	ok("games: an empty list", sources_parse_games("{\"status\":0,\"games\":[]}", games, GAMES_MAX) == 0);
+	games_count = sources_parse_games(answer, games, GAMES_MAX);
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: the game select", discovery_games_message(games, games_count, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b) &&
+	                                     strcmp(topic, "homeassistant/select/ps5_aabbccddeeff/game_select/config") == 0 &&
+	                                     strstr(storage, "\"Ghost of \\\"T\\\" (PPSA02225)\"") &&
+	                                     strstr(storage, "\"Minecraft (PPSA17221)\"") && valid_json(storage));
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: no titles removes the select",
+	   discovery_games_message(games, 0, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b) && storage[0] == 0);
+	char id[16];
+	ok("games: the title ID from an option", discovery_game_from_option("Ghost (of) Tsushima (PPSA02225)", id, sizeof(id)) &&
+	                                             strcmp(id, "PPSA02225") == 0);
+	ok("games: an option without one", !discovery_game_from_option("Minecraft", id, sizeof(id)) &&
+	                                       !discovery_game_from_option("x (ppsa1)", id, sizeof(id)));
+
+	command c = cmd("ps5/aabbccddeeff/command/game_select", "Minecraft (PPSA17221)");
+	ok("command: select a game", c.kind == COMMAND_SELECT_GAME && strcmp(c.text, "PPSA17221") == 0);
+	ok("command: start the game", cmd("ps5/aabbccddeeff/command/start_game", "PRESS").kind == COMMAND_START_GAME);
+	c = cmd("ps5/aabbccddeeff/command/start/payload_ps5_signal", "PRESS");
+	ok("command: start a payload", c.kind == COMMAND_START_PAYLOAD && strcmp(c.text, "payload_ps5_signal") == 0);
+	ok("command: a payload object with odd characters", cmd("ps5/aabbccddeeff/command/start/../x", "PRESS").kind == COMMAND_NONE);
+	ok("command: a start needs PRESS", cmd("ps5/aabbccddeeff/command/start/payload_x", "go").kind == COMMAND_NONE);
+}
+
 int main(void)
 {
 	test_mqtt();
@@ -315,6 +670,9 @@ int main(void)
 	test_discovery();
 	test_commands();
 	test_config();
+	test_events();
+	test_notifications();
+	test_chain();
 	printf("\n%s (%d failure%s)\n", g_failures ? "FAIL" : "PASS", g_failures, g_failures == 1 ? "" : "s");
 	return g_failures != 0;
 }

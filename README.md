@@ -19,12 +19,17 @@ it can show a notification on the screen.
 | Temperature (hottest sensor), Power (SoC and memory), GPU power, Fan, CPU load, GPU clock, Frame rate | sensor | ps5-exporter 0.3.0 or later |
 | Game (its name from ShadowMountPlus, else the title ID), Game title ID, Game running | sensor, binary_sensor | ps5-exporter |
 | Uptime, Free space (internal storage) | sensor | ps5-exporter |
+| Free space (extended storage, `/mnt/ext1`), Free space (USB, `/mnt/usb0`); Unknown when the drive is not there | sensor | ps5-exporter |
+| One per payload in the boot chain: whether it runs (diagnostic) | binary_sensor | the console's process table |
+| Start <payload> (not for etaHEN, kstuff or ps5-homeassistant itself) | button | the boot chain, the ELF loader |
+| Game to start (every title ShadowMountPlus lists), Start game | select, button | ShadowMountPlus, the console |
 | IP address (diagnostic; keeps its last value while the console sleeps) | sensor | ps5-exporter 0.3.0 or later |
 | ps5-exporter, ps5-signal | binary_sensor (diagnostic) | whether each answers |
 | Notification | notify | the console |
 | Beep, Blink the light | button | ps5-signal |
 | Light colour (System, Blue, White, Orange, Purple, Pink, Off) | select | ps5-signal |
 | Rest mode, Power off (only when power actions are on) | button | the console |
+| Trophy, Download, Game started or stopped, Storage job | event | the console, ps5-exporter, ShadowMountPlus (see [Live events](#live-events)) |
 
 A value the console does not report shows as *Unknown*, never as 0. Without ps5-signal the light and beep entities
 show as unavailable. When the console sleeps (rest mode) or the payload stops, the whole device shows as
@@ -63,6 +68,78 @@ Two buttons then appear on the device:
 The console beeps (when ps5-signal runs) and shows a notification first ("Rest mode", "Turning off"). One power action per 10 seconds. Both use the
 system's own services (`sceSystemStateMgrEnterStandby`, `sceSystemStateMgrTurnOff`), not a raw reboot call.
 
+## Live events
+
+Four event entities fire when something happens on the console. Use them as automation triggers.
+
+| Entity | `event_type` | Other attributes | From |
+| --- | --- | --- | --- |
+| Trophy | `bronze`, `silver`, `gold`, `platinum` | `trophy`, `trophy_id`, `trophy_set`, and `title_id` and `game` of the game that runs | the system's notifications, ps5-exporter |
+| Download | `installed`, `ready`, `addon_ready`, `update_added`, `other` | `title_id`, `message` | the system's notifications |
+| Game started or stopped | `started`, `stopped` | `title_id`, `game` | ps5-exporter, every reading interval |
+| Storage job | `completed`, `failed`, `cancelled` | `operation`, `title_id`, `destination`, `error` | ShadowMountPlus' copy, move, unpack and delete jobs |
+
+How they work:
+
+- Trophies and downloads come from the console's own notification list
+  (`/system_data/priv/mms/notification2.db`). The payload never opens that file in place: when it changed, it reads
+  a copy into memory and looks for new rows. It checks every 2 seconds. Notifications from homebrew (this payload's
+  own included) are not events.
+- Nothing fires for what happened before the payload started. After the connection to the broker was lost, an
+  event older than 10 minutes is not sent.
+- Nothing fires while the console sleeps.
+- The trophy fields are based on one trophy notification seen on a PS5 Pro (13.60). The other grades are expected in
+  the same form.
+
+An automation that flashes the lights for a gold or platinum trophy and blinks the console's light:
+
+```yaml
+automation:
+  - alias: PS5 trophy
+    triggers:
+      - trigger: state
+        entity_id: event.ps5_trophy
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state.attributes.event_type in ['gold', 'platinum'] }}"
+    actions:
+      - action: light.turn_on
+        target:
+          entity_id: light.living_room
+        data:
+          flash: short
+      - action: button.press
+        target:
+          entity_id: button.ps5_blink_the_light
+      - action: notify.send_message
+        target:
+          entity_id: notify.ps5_notification
+        data:
+          message: "{{ trigger.to_state.attributes.trophy }}"
+```
+
+Home Assistant names the entities after the device and its area, so `event.ps5_trophy` can be
+`event.living_room_ps5_trophy` on your system. Check the entity ID in Settings > Devices.
+
+## Payloads and starting a game
+
+**Payloads.** ps5-homeassistant reads the boot chain of ps5-autoloader (`autoload.txt` on a USB drive's
+`ps5_autoloader` folder, else `/data/ps5_autoloader`) and shows for each payload whether it runs. It reads the
+console's process table itself, so this also works when ps5-exporter is the payload that stopped. File and process
+names differ (`shadowmountplus_1.7beta5.elf` runs as `shadowmountplus.elf`), so the file name is cut at the first `_`
+or at a `-` before a version number and compared with the start of the process names. When it cannot tell, the sensor
+shows Unknown, not off.
+
+**Start <payload>** sends the payload's ELF to the ELF loader on port 9021, only when it does not run (it does not stop
+and restart a running one), at most once per 10 seconds. etaHEN and kstuff work on the kernel; sending them again can
+hang the console, so they get no button. A notification on the TV says what happened.
+
+**Starting a game.** Choose a title in **Game to start** and press **Start game**. When a game runs, nothing starts
+and the TV says so: close the game first, so no unsaved progress is lost. The list is ShadowMountPlus' titles,
+homebrew included, read every 5 minutes and after a copy, move or delete. Starting uses the system's
+`sceSystemServiceLaunchApp`, in the order websrv (ps5-payload-dev) uses it. Tested with Minecraft on a PS5 Pro
+(13.60); a homebrew title may not start.
+
 ## Waking the console
 
 Not possible from Home Assistant on a jailbroken console. The payload sleeps in rest mode too, and Sony's network
@@ -95,6 +172,8 @@ The device appears in Home Assistant under Settings, Devices and services, MQTT,
 - **Commands** come from anyone who may publish on the broker: give the console's user its own password. Messages
   are checked (length, UTF-8, known colours), and ps5-signal limits beeps and light changes.
 - **Power actions** are off unless you switch them on, take only `PRESS`, and run at most once per 10 seconds.
+- **Live events** send the names of trophies and installed games to your broker. The notification database is only
+  read, from a copy; the payload never writes or locks it.
 
 ## Topics
 
@@ -109,6 +188,10 @@ For a console with id `<id>` (its MAC address without colons):
 | `ps5/<id>/command/beep`, `/blink` | any payload |
 | `ps5/<id>/command/colour` | a colour name from the list above |
 | `ps5/<id>/command/rest`, `/power_off` | `PRESS`; only while power actions are on |
+| `ps5/<id>/event/trophy`, `/download`, `/game`, `/storage` | `{"event_type": ..., ...}`, not retained |
+| `ps5/<id>/payloads` | `{"payload_<name>": true/false/null, ...}`, retained, every reading |
+| `ps5/<id>/command/start/payload_<name>`, `/start_game` | `PRESS` |
+| `ps5/<id>/command/game_select` | an option of the select, `Name (TITLEID)` |
 | `homeassistant/<component>/ps5_<id>/<object>/config` | discovery, retained; sent again when Home Assistant restarts |
 
 [docs/API.md](docs/API.md) describes the local API.
