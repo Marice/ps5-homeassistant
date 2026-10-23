@@ -13,6 +13,11 @@ All notable changes to this project are documented here. The format is based on
   (`completed`, `failed`, `cancelled`) comes from ShadowMountPlus' copy, move, unpack and delete jobs. Nothing fires
   for what happened before the payload started, or for events older than 10 minutes after a lost connection.
 - A trophy event also names the game that runs (`title_id`, `game`), from ps5-exporter's last reading.
+- Free space of the extended storage (`/mnt/ext1`) and the first USB drive (`/mnt/usb0`).
+- A diagnostic sensor per payload in ps5-autoloader's boot chain, and a Start button for each payload that is not
+  running (not for etaHEN, kstuff or ps5-homeassistant itself).
+- Start a game from Home Assistant: a select with every title ShadowMountPlus lists, and a Start game button. It
+  refuses while a game runs.
 - `GET /status` on the local API has an `events` field: empty, or why the live events are not read.
 
 ### Changed

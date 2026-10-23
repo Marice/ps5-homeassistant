@@ -14,7 +14,7 @@ endif
 CFLAGS := -Wall -Wextra -O2 -std=c11 -D_DEFAULT_SOURCE -DHA_VERSION='"$(VERSION)"'
 LDLIBS := -lkernel_sys -lSceSystemService -lpthread
 SRCS   := src/main.c src/mqtt.c src/config.c src/json.c src/buf.c src/http.c src/sources.c src/discovery.c src/power.c \
-          src/events.c src/notifications.c
+          src/events.c src/notifications.c src/chain.c src/procs.c src/launch.c
 HDRS   := $(wildcard src/*.h)
 
 # SQLite (public domain, third_party/sqlite) reads the system's notification database. Built once into its own
@@ -52,7 +52,7 @@ test: build/host/sqlite3.o
 	@mkdir -p build/config
 	@$(HOST_CC) $(HOST_FLAGS) -DCONFIG_DIRECTORY='"build/config"' -o build/test_homeassistant \
 		tests/test_homeassistant.c src/mqtt.c src/config.c src/json.c src/buf.c src/http.c src/sources.c src/discovery.c \
-		src/events.c src/notifications.c build/host/sqlite3.o -lm
+		src/events.c src/notifications.c src/chain.c build/host/sqlite3.o -lm
 	@./build/test_homeassistant
 
 clean:

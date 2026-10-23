@@ -109,8 +109,10 @@ void sources_parse_metrics(const char* text, size_t length, readings* out)
 					} else if (is(line, name_len, "ps5_uptime_seconds")) {
 						set(&out->uptime, v);
 					} else if (is(line, name_len, "ps5_filesystem_avail_bytes") &&
-					           label(labels, labels_len, "mountpoint", tmp, sizeof(tmp)) && strcmp(tmp, "/user") == 0) {
-						set(&out->free_space, v);
+					           label(labels, labels_len, "mountpoint", tmp, sizeof(tmp))) {
+						if (strcmp(tmp, "/user") == 0) set(&out->free_space, v);
+						else if (strcmp(tmp, "/mnt/ext1") == 0) set(&out->free_ext, v);
+						else if (strcmp(tmp, "/mnt/usb0") == 0) set(&out->free_usb, v);
 					} else if (is(line, name_len, "ps5_game_running")) {
 						out->game_running = v > 0.5;
 					} else if (is(line, name_len, "ps5_game_info")) {
@@ -199,4 +201,54 @@ void sources_read_storage(storage_status* out)
 	if (http_request(SHADOWMOUNT_PORT, "POST", "/api/v1/games/storage/status", "{}", answer, sizeof(answer), 1000) ==
 	    200)
 		sources_parse_storage(answer, out);
+}
+
+/* Every title with an ID; a missing name becomes the ID. Sorted by name, case-insensitively. */
+static const char GAMES_QUERY[] =
+	"SELECT json_extract(value, '$.title_id') AS id,"
+	" coalesce(json_extract(value, '$.title_name'), json_extract(value, '$.title_id')) AS name"
+	" FROM json_each(?1, '$.games')"
+	" WHERE json_extract(?1, '$.status') = 0 AND json_type(value, '$.title_id') = 'text'"
+	" ORDER BY lower(name), id LIMIT ?2";
+
+int sources_parse_games(const char* text, game_entry* out, int cap)
+{
+	sqlite3* db = NULL;
+	sqlite3_stmt* q = NULL;
+	int count = -1;
+	if (sqlite3_open_v2(":memory:", &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK &&
+	    sqlite3_prepare_v2(db, GAMES_QUERY, -1, &q, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(q, 1, text, -1, SQLITE_STATIC);
+		sqlite3_bind_int(q, 2, cap);
+		int rc;
+		count = 0;
+		while ((rc = sqlite3_step(q)) == SQLITE_ROW && count < cap) {
+			column_text(q, 0, out[count].title_id, sizeof(out[count].title_id));
+			column_text(q, 1, out[count].name, sizeof(out[count].name));
+			count++;
+		}
+		if (rc != SQLITE_ROW && rc != SQLITE_DONE) count = -1;
+		/* No rows can also be a refused or broken answer: only a real list counts. */
+		if (count == 0) {
+			sqlite3_stmt* check = NULL;
+			if (sqlite3_prepare_v2(db, "SELECT json_valid(?1) AND json_extract(?1, '$.status') = 0", -1, &check, NULL) ==
+			        SQLITE_OK) {
+				sqlite3_bind_text(check, 1, text, -1, SQLITE_STATIC);
+				if (sqlite3_step(check) != SQLITE_ROW || sqlite3_column_int(check, 0) != 1) count = -1;
+			}
+			sqlite3_finalize(check);
+		}
+	}
+	sqlite3_finalize(q);
+	sqlite3_close(db);
+	return count;
+}
+
+int sources_read_games(game_entry* out, int cap)
+{
+	static char answer[512 * 1024];
+	if (http_request(SHADOWMOUNT_PORT, "POST", "/api/v1/games", "{\"include_size\":false}", answer, sizeof(answer),
+	                 3000) != 200)
+		return -1;
+	return sources_parse_games(answer, out, cap);
 }

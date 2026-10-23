@@ -39,6 +39,10 @@ static const entity ENTITIES[] = {
 	  "\"device_class\":\"duration\",\"unit_of_measurement\":\"s\",\"entity_category\":\"diagnostic\"," VALUE("uptime"), false, false, false },
 	{ "sensor", "free_space", "Free space",
 	  "\"device_class\":\"data_size\",\"unit_of_measurement\":\"GB\",\"suggested_display_precision\":1,\"state_class\":\"measurement\"," VALUE("free_space"), false, false, false },
+	{ "sensor", "free_ext", "Free space (extended storage)",
+	  "\"device_class\":\"data_size\",\"unit_of_measurement\":\"GB\",\"suggested_display_precision\":1,\"state_class\":\"measurement\"," VALUE("free_ext"), false, false, false },
+	{ "sensor", "free_usb", "Free space (USB)",
+	  "\"device_class\":\"data_size\",\"unit_of_measurement\":\"GB\",\"suggested_display_precision\":1,\"state_class\":\"measurement\"," VALUE("free_usb"), false, false, false },
 	{ "sensor", "ip_address", "IP address",
 	  "\"icon\":\"mdi:ip-network\",\"entity_category\":\"diagnostic\"," VALUE("ip_address"), false, false, true },
 	{ "binary_sensor", "game_running", "Game running",
@@ -54,6 +58,7 @@ static const entity ENTITIES[] = {
 	{ "select", "colour", "Light colour", "\"icon\":\"mdi:palette\",\"optimistic\":true", true, false, false },
 	{ "button", "rest", "Rest mode", "\"icon\":\"mdi:power-sleep\",\"payload_press\":\"PRESS\"", false, true, false },
 	{ "button", "power_off", "Power off", "\"icon\":\"mdi:power\",\"payload_press\":\"PRESS\"", false, true, false },
+	{ "button", "start_game", "Start game", "\"icon\":\"mdi:play\",\"payload_press\":\"PRESS\"", false, false, false },
 	/* Live events (ps5/<id>/event/<object>, not retained): events.c makes them. */
 	{ "event", "trophy", "Trophy",
 	  "\"icon\":\"mdi:trophy\",\"event_types\":[\"bronze\",\"silver\",\"gold\",\"platinum\"]", false, false, false },
@@ -118,6 +123,18 @@ static void add_text(Buf* b, const char* text, bool escaped)
 	}
 }
 
+/* The device and origin blocks every entity ends with, and the closing brace. */
+static void add_device(Buf* b, const char* id, const readings* r, const char* version)
+{
+	buf_addf(b, "\"device\":{\"identifiers\":[\"ps5_%s\"],\"name\":\"PS5\",\"manufacturer\":\"Sony Interactive Entertainment\",", id);
+	buf_addf(b, "\"model\":\"");
+	add_text(b, r->model[0] ? r->model : "PlayStation 5", true);
+	buf_addf(b, "\",\"sw_version\":\"");
+	add_text(b, r->firmware, true);
+	buf_addf(b, "\"},\"origin\":{\"name\":\"ps5-homeassistant\",\"sw\":\"%s\",\"url\":\"https://github.com/Marice/ps5-homeassistant\"}}",
+	         version);
+}
+
 bool discovery_message(int index, const char* id, const readings* r, bool power_actions, const char* version, char* topic,
                        size_t topic_cap, Buf* b)
 {
@@ -145,13 +162,88 @@ bool discovery_message(int index, const char* id, const readings* r, bool power_
 		if (e->needs_signal) buf_addf(b, ",{\"topic\":\"ps5/%s/signal\"}", id);
 		buf_addf(b, "],\"availability_mode\":\"all\",%s,", e->members);
 	}
-	buf_addf(b, "\"device\":{\"identifiers\":[\"ps5_%s\"],\"name\":\"PS5\",\"manufacturer\":\"Sony Interactive Entertainment\",", id);
-	buf_addf(b, "\"model\":\"");
-	add_text(b, r->model[0] ? r->model : "PlayStation 5", true);
-	buf_addf(b, "\",\"sw_version\":\"");
-	add_text(b, r->firmware, true);
-	buf_addf(b, "\"},\"origin\":{\"name\":\"ps5-homeassistant\",\"sw\":\"%s\",\"url\":\"https://github.com/Marice/ps5-homeassistant\"}}",
-	         version);
+	add_device(b, id, r, version);
+	return true;
+}
+
+void discovery_payload_topic(const char* object, int kind, const char* id, char* topic, size_t topic_cap)
+{
+	snprintf(topic, topic_cap, DISCOVERY_PREFIX "/%s/ps5_%s/%s%s/config", kind == DISCOVERY_PAYLOAD_STATUS ? "binary_sensor" : "button",
+	         id, kind == DISCOVERY_PAYLOAD_STATUS ? "" : "start_", object);
+}
+
+bool discovery_payload_message(const chain_payload* p, int kind, const char* id, const readings* r, const char* version,
+                               char* topic, size_t topic_cap, Buf* b)
+{
+	if (kind == DISCOVERY_PAYLOAD_START && !p->can_start) return false;
+	discovery_payload_topic(p->object, kind, id, topic, topic_cap);
+	const char* prefix = kind == DISCOVERY_PAYLOAD_STATUS ? "" : "start_";
+	buf_addf(b, "{\"name\":\"%s", kind == DISCOVERY_PAYLOAD_STATUS ? "" : "Start ");
+	add_text(b, p->name, false);
+	buf_addf(b, "\",\"unique_id\":\"ps5_%s_%s%s\",\"object_id\":\"ps5_%s%s\",", id, prefix, p->object, prefix, p->object);
+	if (kind == DISCOVERY_PAYLOAD_STATUS) {
+		/* null (the process table unread, or no process matches the name) shows as Unknown. */
+		buf_addf(b, "\"state_topic\":\"ps5/%s/payloads\",\"device_class\":\"running\",\"entity_category\":\"diagnostic\","
+		            "\"payload_on\":true,\"payload_off\":false,\"value_template\":\"{{ value_json.%s }}\",",
+		         id, p->object);
+	} else {
+		buf_addf(b, "\"command_topic\":\"ps5/%s/command/start/%s\",\"payload_press\":\"PRESS\",\"icon\":\"mdi:play-circle\","
+		            "\"entity_category\":\"config\",",
+		         id, p->object);
+	}
+	buf_addf(b, "\"availability\":[{\"topic\":\"ps5/%s/availability\"}],", id);
+	add_device(b, id, r, version);
+	return true;
+}
+
+void discovery_payload_state(const chain_payload* payloads, const int* running, int count, Buf* b)
+{
+	buf_addf(b, "{");
+	for (int i = 0; i < count; i++)
+		buf_addf(b, "%s\"%s\":%s", i ? "," : "", payloads[i].object,
+		         running[i] < 0 ? "null" : running[i] ? "true" : "false");
+	buf_addf(b, "}");
+}
+
+/* An option of the game select: "Name (TITLEID)". */
+static void add_game_option(Buf* b, const game_entry* g)
+{
+	buf_addf(b, "\"");
+	add_text(b, g->name, false);
+	buf_addf(b, " (%s)\"", g->title_id);
+}
+
+bool discovery_games_message(const game_entry* games, int count, const char* id, const readings* r, const char* version,
+                             char* topic, size_t topic_cap, Buf* b)
+{
+	snprintf(topic, topic_cap, DISCOVERY_PREFIX "/select/ps5_%s/game_select/config", id);
+	if (count <= 0) return true; /* no titles: an empty retained config removes the select */
+	buf_addf(b, "{\"name\":\"Game to start\",\"unique_id\":\"ps5_%s_game_select\",\"object_id\":\"ps5_game_select\","
+	            "\"command_topic\":\"ps5/%s/command/game_select\",\"optimistic\":true,\"icon\":\"mdi:gamepad-square\",\"options\":[",
+	         id, id);
+	for (int i = 0; i < count; i++) {
+		if (i) buf_addf(b, ",");
+		add_game_option(b, &games[i]);
+	}
+	buf_addf(b, "],\"availability\":[{\"topic\":\"ps5/%s/availability\"}],", id);
+	add_device(b, id, r, version);
+	return true;
+}
+
+bool discovery_game_from_option(const char* option, char* title_id, size_t cap)
+{
+	size_t n = strlen(option);
+	if (n < 4 || option[n - 1] != ')') return false;
+	const char* open = strrchr(option, '(');
+	if (!open) return false;
+	size_t len = (size_t)(option + n - 1 - (open + 1));
+	if (len < 4 || len >= cap) return false;
+	for (size_t i = 0; i < len; i++) {
+		char c = open[1 + i];
+		if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
+	}
+	memcpy(title_id, open + 1, len);
+	title_id[len] = 0;
 	return true;
 }
 
@@ -172,9 +264,15 @@ void discovery_state(const readings* r, Buf* b)
 	add_reading(b, "gpu_clock", &r->gpu_clock, 0);
 	add_reading(b, "fps", &r->fps, 0);
 	add_reading(b, "uptime", &r->uptime, 0);
-	reading gigabytes = r->free_space;
-	gigabytes.value /= 1e9;
-	add_reading(b, "free_space", &gigabytes, 1);
+	const struct {
+		const char* key;
+		const reading* bytes;
+	} drives[] = { { "free_space", &r->free_space }, { "free_ext", &r->free_ext }, { "free_usb", &r->free_usb } };
+	for (size_t i = 0; i < sizeof(drives) / sizeof(drives[0]); i++) {
+		reading gigabytes = *drives[i].bytes;
+		gigabytes.value /= 1e9;
+		add_reading(b, drives[i].key, &gigabytes, 1);
+	}
 	/* The game: its name when ShadowMountPlus knows it, else the title ID; null when none runs. */
 	if (r->game_running && r->game_id[0]) {
 		buf_addf(b, "\"game\":\"");
@@ -260,6 +358,26 @@ command discovery_command(const char* id, const char* topic, size_t topic_len, c
 	} else if (ACTION("rest") || ACTION("power_off")) {
 		/* Home Assistant's button sends PRESS; anything else is not a press. */
 		if (payload_len == 5 && memcmp(payload, "PRESS", 5) == 0) c.kind = ACTION("rest") ? COMMAND_REST : COMMAND_POWER_OFF;
+	} else if (ACTION("start_game")) {
+		if (payload_len == 5 && memcmp(payload, "PRESS", 5) == 0) c.kind = COMMAND_START_GAME;
+	} else if (ACTION("game_select")) {
+		/* The chosen option, "Name (TITLEID)": only its title ID is kept. */
+		char option[257];
+		if (payload_len == 0 || payload_len >= sizeof(option) || !valid_text(payload, payload_len)) return c;
+		memcpy(option, payload, payload_len);
+		option[payload_len] = 0;
+		if (discovery_game_from_option(option, c.text, sizeof(c.text))) c.kind = COMMAND_SELECT_GAME;
+	} else if (action_len > 6 && strncmp(action, "start/", 6) == 0) {
+		/* start/<object>: a payload of the boot chain; main checks the object against the chain. */
+		size_t len = action_len - 6;
+		if (len >= sizeof(c.text) || payload_len != 5 || memcmp(payload, "PRESS", 5) != 0) return c;
+		for (size_t i = 0; i < len; i++) {
+			char ch = action[6 + i];
+			if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')) return c;
+		}
+		memcpy(c.text, action + 6, len);
+		c.text[len] = 0;
+		c.kind = COMMAND_START_PAYLOAD;
 	} else if (ACTION("beep")) {
 		c.kind = COMMAND_BEEP;
 	} else if (ACTION("blink")) {

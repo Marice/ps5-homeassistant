@@ -19,6 +19,10 @@ it can show a notification on the screen.
 | Temperature (hottest sensor), Power (SoC and memory), GPU power, Fan, CPU load, GPU clock, Frame rate | sensor | ps5-exporter 0.3.0 or later |
 | Game (its name from ShadowMountPlus, else the title ID), Game title ID, Game running | sensor, binary_sensor | ps5-exporter |
 | Uptime, Free space (internal storage) | sensor | ps5-exporter |
+| Free space (extended storage, `/mnt/ext1`), Free space (USB, `/mnt/usb0`); Unknown when the drive is not there | sensor | ps5-exporter |
+| One per payload in the boot chain: whether it runs (diagnostic) | binary_sensor | the console's process table |
+| Start <payload> (not for etaHEN, kstuff or ps5-homeassistant itself) | button | the boot chain, the ELF loader |
+| Game to start (every title ShadowMountPlus lists), Start game | select, button | ShadowMountPlus, the console |
 | IP address (diagnostic; keeps its last value while the console sleeps) | sensor | ps5-exporter 0.3.0 or later |
 | ps5-exporter, ps5-signal | binary_sensor (diagnostic) | whether each answers |
 | Notification | notify | the console |
@@ -117,6 +121,25 @@ automation:
 Home Assistant names the entities after the device and its area, so `event.ps5_trophy` can be
 `event.living_room_ps5_trophy` on your system. Check the entity ID in Settings > Devices.
 
+## Payloads and starting a game
+
+**Payloads.** ps5-homeassistant reads the boot chain of ps5-autoloader (`autoload.txt` on a USB drive's
+`ps5_autoloader` folder, else `/data/ps5_autoloader`) and shows for each payload whether it runs. It reads the
+console's process table itself, so this also works when ps5-exporter is the payload that stopped. File and process
+names differ (`shadowmountplus_1.7beta5.elf` runs as `shadowmountplus.elf`), so the file name is cut at the first `_`
+or at a `-` before a version number and compared with the start of the process names. When it cannot tell, the sensor
+shows Unknown, not off.
+
+**Start <payload>** sends the payload's ELF to the ELF loader on port 9021, only when it does not run (it does not stop
+and restart a running one), at most once per 10 seconds. etaHEN and kstuff work on the kernel; sending them again can
+hang the console, so they get no button. A notification on the TV says what happened.
+
+**Starting a game.** Choose a title in **Game to start** and press **Start game**. When a game runs, nothing starts
+and the TV says so: close the game first, so no unsaved progress is lost. The list is ShadowMountPlus' titles,
+homebrew included, read every 5 minutes and after a copy, move or delete. Starting uses the system's
+`sceSystemServiceLaunchApp`, in the order websrv (ps5-payload-dev) uses it. Tested with Minecraft on a PS5 Pro
+(13.60); a homebrew title may not start.
+
 ## Waking the console
 
 Not possible from Home Assistant on a jailbroken console. The payload sleeps in rest mode too, and Sony's network
@@ -166,6 +189,9 @@ For a console with id `<id>` (its MAC address without colons):
 | `ps5/<id>/command/colour` | a colour name from the list above |
 | `ps5/<id>/command/rest`, `/power_off` | `PRESS`; only while power actions are on |
 | `ps5/<id>/event/trophy`, `/download`, `/game`, `/storage` | `{"event_type": ..., ...}`, not retained |
+| `ps5/<id>/payloads` | `{"payload_<name>": true/false/null, ...}`, retained, every reading |
+| `ps5/<id>/command/start/payload_<name>`, `/start_game` | `PRESS` |
+| `ps5/<id>/command/game_select` | an option of the select, `Name (TITLEID)` |
 | `homeassistant/<component>/ps5_<id>/<object>/config` | discovery, retained; sent again when Home Assistant restarts |
 
 [docs/API.md](docs/API.md) describes the local API.

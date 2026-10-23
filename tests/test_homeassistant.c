@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "../src/buf.h"
+#include "../src/chain.h"
 #include "../src/config.h"
 #include "../src/discovery.h"
 #include "../src/events.h"
@@ -100,7 +101,7 @@ static const char METRICS[] =
 	"ps5_soc_clock_hertz{domain=\"20\",name=\"gpu\"} 2150000000\n"
 	"ps5_fps 59.9\n"
 	"ps5_uptime_seconds 3600\n"
-	"ps5_filesystem_avail_bytes{mountpoint=\"/mnt/usb0\",fstype=\"exfatfs\"} 1\n"
+	"ps5_filesystem_avail_bytes{mountpoint=\"/mnt/usb0\",fstype=\"exfatfs\"} 439337484288\n"
 	"ps5_filesystem_avail_bytes{mountpoint=\"/user\",fstype=\"ufs\"} 179000000000\n"
 	"ps5_game_running 1\n"
 	"ps5_game_info{title_id=\"PPSA00001\"} 1\n"
@@ -123,7 +124,8 @@ static void test_sources(void)
 	ok("metrics: CPU load is the average in percent", r.cpu_load.have && r.cpu_load.value == 50.0);
 	ok("metrics: GPU clock in MHz", r.gpu_clock.have && r.gpu_clock.value == 2150.0);
 	ok("metrics: fps", r.fps.have && r.fps.value > 59.8);
-	ok("metrics: free space on /user only", r.free_space.have && r.free_space.value == 179000000000.0);
+	ok("metrics: free space on /user", r.free_space.have && r.free_space.value == 179000000000.0);
+	ok("metrics: free space on USB; no extended storage", r.free_usb.have && r.free_usb.value == 439337484288.0 && !r.free_ext.have);
 	ok("metrics: the game and its name", r.game_running && strcmp(r.game_id, "PPSA00001") == 0 &&
 	                                         strcmp(r.game_name, "A \\\"quoted\\\" game") == 0);
 	ok("metrics: model and firmware", strcmp(r.model, "CFI-7121") == 0 && strcmp(r.firmware, "13.60") == 0);
@@ -227,7 +229,8 @@ static void test_discovery(void)
 	discovery_state(&r, &b);
 	ok("state: valid JSON with the escaped name", strstr(storage, "\"game\":\"A \\\"quoted\\\" game\"") != NULL);
 	ok("state: the IP address", strstr(storage, "\"ip_address\":\"192.168.68.125\"") != NULL);
-	ok("state: values", strstr(storage, "\"power\":220.5") && strstr(storage, "\"gpu_clock\":2150") && strstr(storage, "\"free_space\":179.0"));
+	ok("state: values", strstr(storage, "\"power\":220.5") && strstr(storage, "\"gpu_clock\":2150") && strstr(storage, "\"free_space\":179.0") &&
+	                         strstr(storage, "\"free_usb\":439.3") && strstr(storage, "\"free_ext\":null"));
 	ok("state: an absent value is null", strstr(storage, "\"signal\":false") && strstr(storage, "\"game_running\":true"));
 	memset(&r, 0, sizeof(r));
 	buf_init(&b, storage, sizeof(storage));
@@ -556,6 +559,110 @@ static void test_notifications(void)
 	   notifications_poll(&reader, 0, 0, rows, &count, error, sizeof(error)) == NOTIFICATIONS_ERROR);
 }
 
+/* ------------------------------------------------------- boot chain */
+
+static void test_chain(void)
+{
+	char key[32];
+	chain_key("shadowmountplus_1.7beta5.elf", key, sizeof(key));
+	ok("chain: key cut at '_'", strcmp(key, "shadowmountplus") == 0);
+	chain_key("/data/x/etaHEN-13.60.elf", key, sizeof(key));
+	ok("chain: key cut at '-' and a digit, lower case", strcmp(key, "etahen") == 0);
+	chain_key("websrv-v0.34.elf", key, sizeof(key));
+	ok("chain: key cut at '-v' and a digit", strcmp(key, "websrv") == 0);
+	chain_key("ps5-exporter.elf", key, sizeof(key));
+	ok("chain: a '-' between words stays", strcmp(key, "ps5-exporter") == 0);
+
+	/* Marice's chain and process names on 23 October 2026 (decision log D14). */
+	const char* list = "nanodns.elf\n!1500\netaHEN-13.60.elf\n!12500\r\nshadowmountplus_1.7beta5.elf # mounts\n!2000\n"
+	                   "ps5-exporter.elf\n!1500\nps5-homeassistant.elf\n@sync\n# ps5-signal-old.elf\n\n"
+	                   "/data/elsewhere/ps5-signal.elf\nps5-exporter.elf\n";
+	chain_payload chain[CHAIN_MAX];
+	int count = chain_parse(list, strlen(list), "/data/ps5_autoloader", chain, CHAIN_MAX);
+	ok("chain: six payloads; sleeps, directives, comments and a repeat skipped", count == 6);
+	ok("chain: relative and absolute paths", strcmp(chain[0].path, "/data/ps5_autoloader/nanodns.elf") == 0 &&
+	                                             strcmp(chain[5].path, "/data/elsewhere/ps5-signal.elf") == 0);
+	ok("chain: a comment after a name", strcmp(chain[2].key, "shadowmountplus") == 0 &&
+	                                        strcmp(chain[2].name, "shadowmountplus_1.7beta5") == 0);
+	ok("chain: object ids", strcmp(chain[3].object, "payload_ps5_exporter") == 0);
+	ok("chain: no start for etaHEN or itself", !chain[1].can_start && !chain[4].can_start && chain[0].can_start &&
+	                                               chain[2].can_start && chain[3].can_start && chain[5].can_start);
+	static const char processes[][20] = { "kernel",           "elfldr.elf",       "etaHEN Critical ser", "nanodns.elf",
+	                                      "shadowmountplus.elf", "ps5-exporter.elf", "ps5-hass.elf",        "eboot.bin" };
+	const int n = (int)(sizeof(processes) / sizeof(processes[0]));
+	int all = 1;
+	for (int i = 0; i < 5; i++) all &= chain_running(&chain[i], processes, n) == 1;
+	ok("chain: each running payload found by its process", all);
+	ok("chain: ps5-signal not running", chain_running(&chain[5], processes, n) == 0);
+	ok("chain: no process table is unknown", chain_running(&chain[0], processes, 0) == -1);
+	static const char lookalike[][20] = { "nanodnsx.elf", "ps5-exporter-dev" };
+	ok("chain: a longer name is another payload", chain_running(&chain[0], lookalike, 2) == 0);
+	ok("chain: a '-' suffix still belongs", chain_running(&chain[3], lookalike, 2) == 1);
+
+	readings r;
+	memset(&r, 0, sizeof(r));
+	static char storage[24 * 1024];
+	char topic[192];
+	Buf b;
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: a payload's status sensor",
+	   discovery_payload_message(&chain[2], DISCOVERY_PAYLOAD_STATUS, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b) &&
+	       strcmp(topic, "homeassistant/binary_sensor/ps5_aabbccddeeff/payload_shadowmountplus/config") == 0 &&
+	       strstr(storage, "\"value_template\":\"{{ value_json.payload_shadowmountplus }}\"") && valid_json(storage));
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: a payload's start button",
+	   discovery_payload_message(&chain[2], DISCOVERY_PAYLOAD_START, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b) &&
+	       strcmp(topic, "homeassistant/button/ps5_aabbccddeeff/start_payload_shadowmountplus/config") == 0 &&
+	       strstr(storage, "\"command_topic\":\"ps5/aabbccddeeff/command/start/payload_shadowmountplus\"") &&
+	       strstr(storage, "\"name\":\"Start shadowmountplus_1.7beta5\"") && valid_json(storage));
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: no start button for etaHEN",
+	   !discovery_payload_message(&chain[1], DISCOVERY_PAYLOAD_START, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b));
+	int running[3] = { 1, 0, -1 };
+	buf_init(&b, storage, sizeof(storage));
+	discovery_payload_state(chain, running, 3, &b);
+	ok("state: payloads true, false and unknown",
+	   strcmp(storage, "{\"payload_nanodns\":true,\"payload_etahen\":false,\"payload_shadowmountplus\":null}") == 0);
+
+	/* The game list, as ShadowMountPlus answers (shortened; fractions and escapes as it sends them). */
+	const char* answer =
+		"{\"status\":0,\"games\":[{\"title_id\":\"PPSA17221\",\"title_name\":\"Minecraft\",\"size\":0.5},"
+		"{\"title_id\":\"PPSA21904\",\"title_name\":\"\\u5f9e\\u524d\"},{\"title_id\":\"PPSA02225\",\"title_name\":\"Ghost of \\\"T\\\"\"},"
+		"{\"title_id\":\"PPSA99000\"},{\"title_name\":\"no id\"}]}";
+	game_entry games[GAMES_MAX];
+	int games_count = sources_parse_games(answer, games, GAMES_MAX);
+	ok("games: titles with an id, sorted by name", games_count == 4 && strcmp(games[0].title_id, "PPSA02225") == 0 &&
+	                                                   strcmp(games[1].title_id, "PPSA17221") == 0);
+	ok("games: a missing name is the id; escapes decoded",
+	   strcmp(games[2].name, "PPSA99000") == 0 && strcmp(games[0].name, "Ghost of \"T\"") == 0 &&
+	       strcmp(games[3].name, "\xe5\xbe\x9e\xe5\x89\x8d") == 0);
+	ok("games: an error answer is no list", sources_parse_games("{\"status\":2,\"error\":\"x\"}", games, GAMES_MAX) == -1);
+	ok("games: garbage is no list", sources_parse_games("<html>", games, GAMES_MAX) == -1);
+	ok("games: an empty list", sources_parse_games("{\"status\":0,\"games\":[]}", games, GAMES_MAX) == 0);
+	games_count = sources_parse_games(answer, games, GAMES_MAX);
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: the game select", discovery_games_message(games, games_count, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b) &&
+	                                     strcmp(topic, "homeassistant/select/ps5_aabbccddeeff/game_select/config") == 0 &&
+	                                     strstr(storage, "\"Ghost of \\\"T\\\" (PPSA02225)\"") &&
+	                                     strstr(storage, "\"Minecraft (PPSA17221)\"") && valid_json(storage));
+	buf_init(&b, storage, sizeof(storage));
+	ok("discovery: no titles removes the select",
+	   discovery_games_message(games, 0, "aabbccddeeff", &r, "0.1.0", topic, sizeof(topic), &b) && storage[0] == 0);
+	char id[16];
+	ok("games: the title ID from an option", discovery_game_from_option("Ghost (of) Tsushima (PPSA02225)", id, sizeof(id)) &&
+	                                             strcmp(id, "PPSA02225") == 0);
+	ok("games: an option without one", !discovery_game_from_option("Minecraft", id, sizeof(id)) &&
+	                                       !discovery_game_from_option("x (ppsa1)", id, sizeof(id)));
+
+	command c = cmd("ps5/aabbccddeeff/command/game_select", "Minecraft (PPSA17221)");
+	ok("command: select a game", c.kind == COMMAND_SELECT_GAME && strcmp(c.text, "PPSA17221") == 0);
+	ok("command: start the game", cmd("ps5/aabbccddeeff/command/start_game", "PRESS").kind == COMMAND_START_GAME);
+	c = cmd("ps5/aabbccddeeff/command/start/payload_ps5_signal", "PRESS");
+	ok("command: start a payload", c.kind == COMMAND_START_PAYLOAD && strcmp(c.text, "payload_ps5_signal") == 0);
+	ok("command: a payload object with odd characters", cmd("ps5/aabbccddeeff/command/start/../x", "PRESS").kind == COMMAND_NONE);
+	ok("command: a start needs PRESS", cmd("ps5/aabbccddeeff/command/start/payload_x", "go").kind == COMMAND_NONE);
+}
+
 int main(void)
 {
 	test_mqtt();
@@ -565,6 +672,7 @@ int main(void)
 	test_config();
 	test_events();
 	test_notifications();
+	test_chain();
 	printf("\n%s (%d failure%s)\n", g_failures ? "FAIL" : "PASS", g_failures, g_failures == 1 ? "" : "s");
 	return g_failures != 0;
 }

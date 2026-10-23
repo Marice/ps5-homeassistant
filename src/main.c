@@ -21,13 +21,16 @@
 #include <sys/stat.h>
 
 #include "buf.h"
+#include "chain.h"
 #include "config.h"
 #include "discovery.h"
 #include "events.h"
 #include "http.h"
+#include "launch.h"
 #include "mqtt.h"
 #include "notifications.h"
 #include "power.h"
+#include "procs.h"
 #include "sources.h"
 
 #ifndef HA_VERSION
@@ -279,6 +282,7 @@ static long long now_ms(void)
 
 static event_state g_events;
 static notifications_reader g_notifications;
+static volatile int g_games_due = 1; /* read ShadowMountPlus' titles again */
 
 /* The note goes into /status between JSON quotes: quotes, backslashes and control characters become spaces. */
 static void set_events_note(const char* note)
@@ -324,6 +328,7 @@ static int check_events(mqtt* m)
 	storage_status storage;
 	sources_read_storage(&storage);
 	int n = events_from_storage(&g_events, &storage, events, NOTIFICATIONS_MAX_ROWS);
+	if (n > 0) g_games_due = 1; /* a copy, move or delete can change the list of titles */
 	return publish_events(m, events, n);
 }
 
@@ -332,6 +337,197 @@ static int reading_events(mqtt* m, const readings* r)
 	console_event events[2];
 	int n = events_from_reading(&g_events, r, events, 2);
 	return publish_events(m, events, n);
+}
+
+/* ---- the boot chain's payloads and the titles to start (decision log D14) ---- */
+
+#define GAMES_REFRESH_MS (5LL * 60 * 1000)
+#define PUBLISHED_PAYLOADS CONFIG_DIRECTORY "/payloads.txt" /* object ids with discovery sent, to remove them later */
+
+static chain_payload g_chain[CHAIN_MAX];
+static int g_chain_count;
+static long long g_chain_mtime = -1;
+static game_entry g_games[GAMES_MAX];
+static int g_games_count = -1;
+static char g_selected[16]; /* the title chosen in the select */
+static char g_processes[PROCS_MAX][20];
+
+/* Reads the boot chain again when its file changed (or another one is used). True when the list of payloads
+   changed. */
+static bool load_chain(void)
+{
+	char path[160], dir[128];
+	struct stat st;
+	long long mtime = -2;
+	if (chain_locate(path, sizeof(path), dir, sizeof(dir)) && stat(path, &st) == 0)
+		mtime = (long long)st.st_mtime * 1000000000LL + st.st_mtim.tv_nsec + (long long)st.st_size;
+	if (mtime == g_chain_mtime) return false;
+	g_chain_mtime = mtime;
+	static chain_payload next[CHAIN_MAX];
+	int count = 0;
+	FILE* f = mtime >= 0 ? fopen(path, "r") : NULL;
+	if (f) {
+		static char text[16 * 1024];
+		size_t n = fread(text, 1, sizeof(text), f);
+		fclose(f);
+		count = chain_parse(text, n, dir, next, CHAIN_MAX);
+	}
+	bool changed = count != g_chain_count;
+	for (int i = 0; !changed && i < count; i++) changed = strcmp(next[i].object, g_chain[i].object) != 0;
+	memcpy(g_chain, next, sizeof(next));
+	g_chain_count = count;
+	return changed;
+}
+
+/* Status and start entities for the chain; those of payloads that left the chain are removed (empty retained
+   configs), using the list kept from the last time. */
+static int publish_chain_discovery(mqtt* m, const readings* r)
+{
+	static char storage[4096];
+	char t[192];
+	FILE* f = fopen(PUBLISHED_PAYLOADS, "r");
+	char line[64];
+	while (f && fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = 0;
+		bool kept = false;
+		for (int i = 0; i < g_chain_count; i++) kept |= strcmp(line, g_chain[i].object) == 0;
+		if (kept || !line[0]) continue;
+		for (int kind = DISCOVERY_PAYLOAD_STATUS; kind <= DISCOVERY_PAYLOAD_START; kind++) {
+			discovery_payload_topic(line, kind, g_id, t, sizeof(t));
+			if (publish_text(m, t, "", 1) != 0) {
+				fclose(f);
+				return -1;
+			}
+		}
+	}
+	if (f) fclose(f);
+	mkdir(CONFIG_DIRECTORY, 0755);
+	f = fopen(PUBLISHED_PAYLOADS, "w");
+	for (int i = 0; i < g_chain_count; i++) {
+		if (f) fprintf(f, "%s\n", g_chain[i].object);
+		for (int kind = DISCOVERY_PAYLOAD_STATUS; kind <= DISCOVERY_PAYLOAD_START; kind++) {
+			Buf b;
+			buf_init(&b, storage, sizeof(storage));
+			if (!discovery_payload_message(&g_chain[i], kind, g_id, r, HA_VERSION, t, sizeof(t), &b) || b.truncated) continue;
+			if (publish_text(m, t, storage, 1) != 0) {
+				if (f) fclose(f);
+				return -1;
+			}
+		}
+	}
+	if (f) fclose(f);
+	return 0;
+}
+
+/* Whether each chain payload runs, from the process table (not from ps5-exporter, which is one of them). */
+static int publish_chain_state(mqtt* m)
+{
+	int count = procs_names(g_processes, PROCS_MAX);
+	int running[CHAIN_MAX];
+	for (int i = 0; i < g_chain_count; i++) running[i] = chain_running(&g_chain[i], (const char(*)[20])g_processes, count);
+	static char storage[1024];
+	Buf b;
+	buf_init(&b, storage, sizeof(storage));
+	discovery_payload_state(g_chain, running, g_chain_count, &b);
+	if (b.truncated) return 0;
+	return publish_text(m, topic("payloads"), storage, 1);
+}
+
+static int publish_games_discovery(mqtt* m, const readings* r)
+{
+	static char storage[24 * 1024];
+	char t[192];
+	Buf b;
+	buf_init(&b, storage, sizeof(storage));
+	if (!discovery_games_message(g_games, g_games_count, g_id, r, HA_VERSION, t, sizeof(t), &b) || b.truncated) return 0;
+	return publish_text(m, t, storage, 1);
+}
+
+/* ShadowMountPlus' titles, every GAMES_REFRESH_MS and after a storage job; the select is sent again when the list
+   changed. A ShadowMountPlus that does not answer keeps the last list. */
+static int refresh_games(mqtt* m, const readings* r)
+{
+	static game_entry next[GAMES_MAX];
+	int count = sources_read_games(next, GAMES_MAX);
+	if (count < 0) return 0;
+	if (count == g_games_count && memcmp(next, g_games, sizeof(game_entry) * (size_t)count) == 0) return 0;
+	memcpy(g_games, next, sizeof(next));
+	g_games_count = count;
+	return publish_games_discovery(m, r);
+}
+
+static int publish_all_discovery(mqtt* m, const readings* r, bool power_actions)
+{
+	if (publish_discovery(m, r, power_actions) != 0 || publish_chain_discovery(m, r) != 0) return -1;
+	return g_games_count >= 0 ? publish_games_discovery(m, r) : 0;
+}
+
+/* A rich notification with Home Assistant's icon, for what a start did. */
+static void tell(const char* text)
+{
+	notify_rich("Home Assistant", text, access(ICON_PATH, R_OK) == 0 ? ICON_URL : NULL);
+}
+
+static bool game_runs(void)
+{
+	int count = procs_names(g_processes, PROCS_MAX);
+	for (int i = 0; i < count; i++)
+		if (strcmp(g_processes[i], "eboot.bin") == 0) return true;
+	return false;
+}
+
+static void start_payload(const char* object)
+{
+	static long long last;
+	char text[160], error[128];
+	const chain_payload* p = NULL;
+	for (int i = 0; i < g_chain_count; i++)
+		if (strcmp(g_chain[i].object, object) == 0) p = &g_chain[i];
+	if (!p || !p->can_start) return; /* not a button this payload offers */
+	if (last && now_ms() - last < 10000) return;
+	last = now_ms();
+	int count = procs_names(g_processes, PROCS_MAX);
+	int running = chain_running(p, (const char(*)[20])g_processes, count);
+	if (running != 0) {
+		snprintf(text, sizeof(text), running > 0 ? "%s runs already" : "%s: cannot tell whether it runs", p->name);
+		tell(text);
+		return;
+	}
+	if (launch_payload(p->path, error, sizeof(error)) != 0) snprintf(text, sizeof(text), "%s did not start: %s", p->name, error);
+	else snprintf(text, sizeof(text), "Starting %s", p->name);
+	tell(text);
+}
+
+static void start_game(void)
+{
+	static long long last;
+	char text[200], error[128];
+	if (last && now_ms() - last < 10000) return;
+	last = now_ms();
+	if (!g_selected[0]) {
+		tell("Choose a game to start first");
+		return;
+	}
+	const char* name = g_selected;
+	for (int i = 0; i < g_games_count; i++)
+		if (strcmp(g_games[i].title_id, g_selected) == 0) name = g_games[i].name;
+	if (game_runs()) {
+		snprintf(text, sizeof(text), "A game runs: close it first to start %s", name);
+		tell(text);
+		return;
+	}
+	int code = 0;
+	if (launch_title(g_selected, &code, error, sizeof(error)) != 0) {
+		/* A start once answered non-zero and still worked (decision log D14): look before saying it failed. */
+		sleep(3);
+		if (code == 0 || !game_runs()) {
+			snprintf(text, sizeof(text), "%s did not start: %s", name, error);
+			tell(text);
+		}
+		return;
+	}
+	snprintf(text, sizeof(text), "Starting %s", name);
+	tell(text);
 }
 
 /* Rest mode or power off, when allowed: beeps, says so on the TV, marks the device offline (the session will not
@@ -404,6 +600,15 @@ static void run(const command* c, const session_context* s)
 	case COMMAND_POWER_OFF:
 		power_action(c, s->m, s->conf);
 		break;
+	case COMMAND_START_PAYLOAD:
+		start_payload(c->text);
+		break;
+	case COMMAND_SELECT_GAME:
+		snprintf(g_selected, sizeof(g_selected), "%s", c->text);
+		break;
+	case COMMAND_START_GAME:
+		start_game();
+		break;
 	default:
 		break;
 	}
@@ -446,9 +651,10 @@ static int session(const config* c)
 		return -1;
 	}
 	session_context context = { &m, c };
-	if (publish_discovery(&m, &r, c->power_actions) != 0 || publish_text(&m, will, "online", 1) != 0 ||
+	load_chain();
+	if (publish_all_discovery(&m, &r, c->power_actions) != 0 || publish_text(&m, will, "online", 1) != 0 ||
 	    mqtt_subscribe(&m, topic("command/#")) != 0 || mqtt_subscribe(&m, DISCOVERY_PREFIX "/status") != 0 ||
-	    publish_state(&m, &r) != 0) {
+	    publish_state(&m, &r) != 0 || publish_chain_state(&m) != 0) {
 		mqtt_close(&m);
 		set_status("disconnected", "the connection dropped");
 		return -1;
@@ -462,6 +668,7 @@ static int session(const config* c)
 	}
 	long long next = now_ms() + (long long)c->interval * 1000;
 	long long next_events = now_ms();
+	long long next_games = now_ms();
 	time_t wall = time(NULL);
 	for (;;) {
 		if (g_quit || g_reconfigured) break;
@@ -472,12 +679,19 @@ static int session(const config* c)
 		if (mqtt_poll(&m, 500, on_message, &context) != 0) break;
 		if (g_rediscover) {
 			g_rediscover = 0;
-			if (publish_discovery(&m, &r, c->power_actions) != 0) break;
+			if (publish_all_discovery(&m, &r, c->power_actions) != 0) break;
 		}
 		if (now_ms() >= next) {
 			sources_read(&r);
 			if (publish_state(&m, &r) != 0 || reading_events(&m, &r) != 0) break;
+			if (load_chain() && publish_chain_discovery(&m, &r) != 0) break;
+			if (publish_chain_state(&m) != 0) break;
 			next = now_ms() + (long long)c->interval * 1000;
+		}
+		if (g_games_due || now_ms() >= next_games) {
+			g_games_due = 0;
+			if (refresh_games(&m, &r) != 0) break;
+			next_games = now_ms() + GAMES_REFRESH_MS;
 		}
 		if (now_ms() >= next_events) {
 			if (check_events(&m) != 0) break;
