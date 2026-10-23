@@ -416,6 +416,22 @@ static void test_events(void)
 	n = events_from_reading(&s, &r, out, 8);
 	ok("game: quitting is a stop", n == 1 && strstr(out[0].payload, "\"stopped\"") && strstr(out[0].payload, "Second"));
 
+	/* A trophy names the game that runs; without a game, only the trophy set. */
+	r.game_running = true;
+	snprintf(r.game_id, sizeof(r.game_id), "PPSA00003");
+	snprintf(r.game_name, sizeof(r.game_name), "Third");
+	events_from_reading(&s, &r, out, 8);
+	notification_row during = trophy_row(30, now - 10, "Bronze", "In game");
+	n = events_from_notifications(&s, &during, 1, now, out, 8);
+	ok("trophy: the running game's title ID and name", n == 1 && strstr(out[0].payload, "\"title_id\":\"PPSA00003\"") &&
+	                                                       strstr(out[0].payload, "\"game\":\"Third\""));
+	r.game_running = false;
+	events_from_reading(&s, &r, out, 8);
+	notification_row after = trophy_row(31, now - 5, "Silver", "No game");
+	n = events_from_notifications(&s, &after, 1, now, out, 8);
+	ok("trophy: no game running, no game fields", n == 1 && strstr(out[0].payload, "title_id") == NULL &&
+	                                                  strstr(out[0].payload, "\"game\"") == NULL);
+
 	/* ShadowMountPlus' storage jobs. */
 	storage_status st;
 	memset(&st, 0, sizeof(st));

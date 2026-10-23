@@ -81,7 +81,11 @@ static int notification_event(event_state* s, const notification_row* row, conso
 		add_member(&b, "trophy", row->trophy_name);
 		add_member(&b, "trophy_id", row->trophy_id);
 		add_member(&b, "trophy_set", row->np_comm_id);
-		add_member(&b, "title_id", row->title_id);
+		/* The notification names only the trophy set; a trophy is earned in the game that runs (from the last
+		   reading of ps5-exporter, so at most one interval old). */
+		const char* title = row->title_id[0] ? row->title_id : s->game_id;
+		add_member(&b, "title_id", title);
+		if (title[0] && strcmp(title, s->game_id) == 0) add_member(&b, "game", s->game_name[0] ? s->game_name : title);
 		return close_event(&b);
 	}
 	if (strcmp(row->channel, "Downloads") == 0) {

@@ -12,6 +12,7 @@ All notable changes to this project are documented here. The format is based on
   a copy every 2 seconds and never locked or written. Game started or stopped comes from ps5-exporter. Storage job
   (`completed`, `failed`, `cancelled`) comes from ShadowMountPlus' copy, move, unpack and delete jobs. Nothing fires
   for what happened before the payload started, or for events older than 10 minutes after a lost connection.
+- A trophy event also names the game that runs (`title_id`, `game`), from ps5-exporter's last reading.
 - `GET /status` on the local API has an `events` field: empty, or why the live events are not read.
 
 ### Changed

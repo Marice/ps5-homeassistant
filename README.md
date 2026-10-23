@@ -70,7 +70,7 @@ Four event entities fire when something happens on the console. Use them as auto
 
 | Entity | `event_type` | Other attributes | From |
 | --- | --- | --- | --- |
-| Trophy | `bronze`, `silver`, `gold`, `platinum` | `trophy`, `trophy_id`, `trophy_set` | the system's notifications |
+| Trophy | `bronze`, `silver`, `gold`, `platinum` | `trophy`, `trophy_id`, `trophy_set`, and `title_id` and `game` of the game that runs | the system's notifications, ps5-exporter |
 | Download | `installed`, `ready`, `addon_ready`, `update_added`, `other` | `title_id`, `message` | the system's notifications |
 | Game started or stopped | `started`, `stopped` | `title_id`, `game` | ps5-exporter, every reading interval |
 | Storage job | `completed`, `failed`, `cancelled` | `operation`, `title_id`, `destination`, `error` | ShadowMountPlus' copy, move, unpack and delete jobs |
