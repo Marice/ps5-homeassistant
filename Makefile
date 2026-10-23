@@ -5,7 +5,7 @@
 PS5_HOST ?= 192.168.68.125
 
 TITLE   := ps5-homeassistant
-VERSION := 0.2.1
+VERSION := 0.3.0
 
 ifdef PS5_PAYLOAD_SDK
     include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
