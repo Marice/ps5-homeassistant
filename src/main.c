@@ -2,8 +2,9 @@
  *
  * Reads ps5-exporter (127.0.0.1:9100) and ps5-signal (127.0.0.1:9150) on the console, publishes the values
  * with Home Assistant's MQTT discovery, and carries out what HA sends: a notification on the screen, a beep,
- * a blink or a colour of the light (through ps5-signal). The broker is set in config.json, by Signal
- * Companion through the local API on 127.0.0.1:9160. */
+ * a blink or a colour of the light (through ps5-signal). It also sends live events: trophies and downloads from
+ * the system's notification database, games started and stopped, ShadowMountPlus storage jobs. The broker is set
+ * in config.json, by Signal Companion through the local API on 127.0.0.1:9160. */
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -22,8 +23,10 @@
 #include "buf.h"
 #include "config.h"
 #include "discovery.h"
+#include "events.h"
 #include "http.h"
 #include "mqtt.h"
+#include "notifications.h"
 #include "power.h"
 #include "sources.h"
 
@@ -127,6 +130,7 @@ static volatile int g_reconfigured; /* the config changed: connect again */
 static volatile int g_quit;
 static char g_state[48] = "not configured";
 static char g_error[128] = "";
+static char g_events_note[128] = ""; /* why an event source is not read, or what was skipped; "" when all is well */
 
 static void set_status(const char* state, const char* error)
 {
@@ -142,8 +146,9 @@ static int handle(const char* method, const char* path, const char* request_body
 {
 	if (strcmp(path, "/status") == 0 && strcmp(method, "GET") == 0) {
 		pthread_mutex_lock(&g_lock);
-		snprintf(body, cap, "{\"service\":\"ps5-homeassistant\",\"version\":\"%s\",\"state\":\"%s\",\"error\":\"%s\"}",
-		         HA_VERSION, g_state, g_error);
+		snprintf(body, cap,
+		         "{\"service\":\"ps5-homeassistant\",\"version\":\"%s\",\"state\":\"%s\",\"error\":\"%s\",\"events\":\"%s\"}",
+		         HA_VERSION, g_state, g_error, g_events_note);
 		pthread_mutex_unlock(&g_lock);
 		return 200;
 	}
@@ -268,6 +273,67 @@ static long long now_ms(void)
 	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* ---- live events (events.c): the cursor lives as long as the payload, across sessions ---- */
+
+#define EVENTS_TICK_MS 2000
+
+static event_state g_events;
+static notifications_reader g_notifications;
+
+/* The note goes into /status between JSON quotes: quotes, backslashes and control characters become spaces. */
+static void set_events_note(const char* note)
+{
+	pthread_mutex_lock(&g_lock);
+	size_t i = 0;
+	for (; note[i] && i + 1 < sizeof(g_events_note); i++) {
+		unsigned char c = (unsigned char)note[i];
+		g_events_note[i] = (c < 32 || c == '"' || c == '\\') ? ' ' : (char)c;
+	}
+	g_events_note[i] = 0;
+	pthread_mutex_unlock(&g_lock);
+}
+
+static int publish_events(mqtt* m, const console_event* events, int count)
+{
+	char suffix[32];
+	for (int i = 0; i < count; i++) {
+		snprintf(suffix, sizeof(suffix), "event/%s", events[i].object);
+		if (publish_text(m, topic(suffix), events[i].payload, 0) != 0) return -1;
+	}
+	return 0;
+}
+
+/* The notification database and ShadowMountPlus' storage job, every EVENTS_TICK_MS. */
+static int check_events(mqtt* m)
+{
+	static notification_row rows[NOTIFICATIONS_MAX_ROWS];
+	static console_event events[NOTIFICATIONS_MAX_ROWS];
+	int count = 0;
+	char error[128];
+	notifications_result result = notifications_poll(&g_notifications, g_events.last_id, g_events.last_updated_ms, rows,
+	                                                 &count, error, sizeof(error));
+	if (result == NOTIFICATIONS_ERROR) set_events_note(error);
+	if (result == NOTIFICATIONS_READ) {
+		struct timespec wall;
+		clock_gettime(CLOCK_REALTIME, &wall);
+		long long wall_ms = (long long)wall.tv_sec * 1000 + wall.tv_nsec / 1000000;
+		int n = events_from_notifications(&g_events, rows, count, wall_ms, events, NOTIFICATIONS_MAX_ROWS);
+		set_events_note(g_events.skipped[0] ? g_events.skipped : "");
+		if (publish_events(m, events, n) != 0) return -1;
+	}
+	storage_status storage;
+	sources_read_storage(&storage);
+	int n = events_from_storage(&g_events, &storage, events, NOTIFICATIONS_MAX_ROWS);
+	return publish_events(m, events, n);
+}
+
+static int reading_events(mqtt* m, const readings* r)
+{
+	console_event events[2];
+	int n = events_from_reading(&g_events, r, events, 2);
+	return publish_events(m, events, n);
+}
+
 /* Rest mode or power off, when allowed: beeps, says so on the TV, marks the device offline (the session will not
    say goodbye from rest mode), then asks the system. */
 static void power_action(const command* c, mqtt* m, const config* conf)
@@ -374,6 +440,11 @@ static int session(const config* c)
 	}
 	readings r;
 	sources_read(&r);
+	if (reading_events(&m, &r) != 0) {
+		mqtt_close(&m);
+		set_status("disconnected", "the connection dropped");
+		return -1;
+	}
 	session_context context = { &m, c };
 	if (publish_discovery(&m, &r, c->power_actions) != 0 || publish_text(&m, will, "online", 1) != 0 ||
 	    mqtt_subscribe(&m, topic("command/#")) != 0 || mqtt_subscribe(&m, DISCOVERY_PREFIX "/status") != 0 ||
@@ -390,6 +461,7 @@ static int session(const config* c)
 		notify("ps5-homeassistant: connected to Home Assistant");
 	}
 	long long next = now_ms() + (long long)c->interval * 1000;
+	long long next_events = now_ms();
 	time_t wall = time(NULL);
 	for (;;) {
 		if (g_quit || g_reconfigured) break;
@@ -404,8 +476,12 @@ static int session(const config* c)
 		}
 		if (now_ms() >= next) {
 			sources_read(&r);
-			if (publish_state(&m, &r) != 0) break;
+			if (publish_state(&m, &r) != 0 || reading_events(&m, &r) != 0) break;
 			next = now_ms() + (long long)c->interval * 1000;
+		}
+		if (now_ms() >= next_events) {
+			if (check_events(&m) != 0) break;
+			next_events = now_ms() + EVENTS_TICK_MS;
 		}
 	}
 	/* A clean goodbye: the will only fires when the connection is lost. */
@@ -425,6 +501,8 @@ int main(void)
 	sceKernelSetProcessName("ps5-hass.elf");
 	signal(SIGPIPE, SIG_IGN);
 	console_id();
+	events_init(&g_events);
+	notifications_init(&g_notifications, NOTIFICATIONS_PATH);
 	char error[128];
 	if (!config_load(&g_config, error, sizeof(error))) {
 		set_status("not configured", error);

@@ -5,13 +5,15 @@ JSON.
 
 | Request | Body | Answer |
 | --- | --- | --- |
-| `GET /status` | | `{"service":"ps5-homeassistant","version":"0.2.1","state":"connected","error":""}` |
+| `GET /status` | | `{"service":"ps5-homeassistant","version":"0.2.1","state":"connected","error":"","events":""}` |
 | `GET /config` | | `{"host":"...","port":1883,"username":"ps5","password_set":true,"interval":10,"power_actions":false}` |
 | `PUT /config` | any of `host`, `port`, `username`, `password`, `interval`, `power_actions` | the config as `GET /config` shows it, or `400` with `{"error":"..."}` |
 | `POST /quit` | | stops the payload |
 
 `state` is one of `not configured`, `connecting`, `connected`, `disconnected`. `error` says why a connection
-failed, for example `the broker refused the username or password`.
+failed, for example `the broker refused the username or password`. `events` is empty while the live events work;
+otherwise it says why the notification database is not read, or what was skipped (for example an unknown trophy
+grade).
 
 ## Config rules
 

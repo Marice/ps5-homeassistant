@@ -54,6 +54,16 @@ static const entity ENTITIES[] = {
 	{ "select", "colour", "Light colour", "\"icon\":\"mdi:palette\",\"optimistic\":true", true, false, false },
 	{ "button", "rest", "Rest mode", "\"icon\":\"mdi:power-sleep\",\"payload_press\":\"PRESS\"", false, true, false },
 	{ "button", "power_off", "Power off", "\"icon\":\"mdi:power\",\"payload_press\":\"PRESS\"", false, true, false },
+	/* Live events (ps5/<id>/event/<object>, not retained): events.c makes them. */
+	{ "event", "trophy", "Trophy",
+	  "\"icon\":\"mdi:trophy\",\"event_types\":[\"bronze\",\"silver\",\"gold\",\"platinum\"]", false, false, false },
+	{ "event", "download", "Download",
+	  "\"icon\":\"mdi:download\",\"event_types\":[\"installed\",\"ready\",\"addon_ready\",\"update_added\",\"other\"]",
+	  false, false, false },
+	{ "event", "game", "Game started or stopped",
+	  "\"icon\":\"mdi:gamepad-variant\",\"event_types\":[\"started\",\"stopped\"]", false, false, false },
+	{ "event", "storage", "Storage job",
+	  "\"icon\":\"mdi:harddisk\",\"event_types\":[\"completed\",\"failed\",\"cancelled\"]", false, false, false },
 };
 #define ENTITY_COUNT ((int)(sizeof(ENTITIES) / sizeof(ENTITIES[0])))
 
@@ -119,6 +129,8 @@ bool discovery_message(int index, const char* id, const readings* r, bool power_
 	         e->object);
 	if (strcmp(e->component, "sensor") == 0 || strcmp(e->component, "binary_sensor") == 0)
 		buf_addf(b, "\"state_topic\":\"ps5/%s/state\",", id);
+	else if (strcmp(e->component, "event") == 0)
+		buf_addf(b, "\"state_topic\":\"ps5/%s/event/%s\",", id, e->object);
 	else
 		buf_addf(b, "\"command_topic\":\"ps5/%s/command/%s\",", id, e->object);
 	if (strcmp(e->component, "select") == 0) {

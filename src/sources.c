@@ -1,6 +1,7 @@
 #include "sources.h"
 
 #include "http.h"
+#include "../third_party/sqlite/sqlite3.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,4 +152,51 @@ void sources_read(readings* out)
 	}
 	char answer[2048];
 	out->signal = http_request(SIGNAL_PORT, "GET", "/status", NULL, answer, sizeof(answer), 1000) == 200;
+}
+
+/* ShadowMountPlus' answer holds fractions (progress_percent), which the small JSON reader refuses on purpose; the
+   storage status is read with SQLite's JSON functions, already in the payload for the notification database. */
+static const char STORAGE_QUERY[] =
+	"SELECT json_extract(?1, '$.status'), json_extract(?1, '$.job_id'), json_extract(?1, '$.state'),"
+	" json_extract(?1, '$.operation'), json_extract(?1, '$.title_id'), json_extract(?1, '$.destination'),"
+	" json_extract(?1, '$.result_error')"
+	" WHERE json_valid(?1)";
+
+static void column_text(sqlite3_stmt* q, int column, char* out, size_t cap)
+{
+	const unsigned char* text = sqlite3_column_text(q, column);
+	snprintf(out, cap, "%s", text ? (const char*)text : "");
+}
+
+void sources_parse_storage(const char* text, storage_status* out)
+{
+	memset(out, 0, sizeof(*out));
+	sqlite3* db = NULL;
+	sqlite3_stmt* q = NULL;
+	if (sqlite3_open_v2(":memory:", &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK &&
+	    sqlite3_prepare_v2(db, STORAGE_QUERY, -1, &q, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(q, 1, text, -1, SQLITE_STATIC);
+		/* status 0 and a job id: the answer describes a job (none yet gives an error status) */
+		if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_type(q, 0) == SQLITE_INTEGER &&
+		    sqlite3_column_int64(q, 0) == 0 && sqlite3_column_type(q, 1) == SQLITE_INTEGER) {
+			out->have = true;
+			out->job_id = sqlite3_column_int64(q, 1);
+			column_text(q, 2, out->state, sizeof(out->state));
+			column_text(q, 3, out->operation, sizeof(out->operation));
+			column_text(q, 4, out->title_id, sizeof(out->title_id));
+			column_text(q, 5, out->destination, sizeof(out->destination));
+			column_text(q, 6, out->error, sizeof(out->error));
+		}
+	}
+	sqlite3_finalize(q);
+	sqlite3_close(db);
+}
+
+void sources_read_storage(storage_status* out)
+{
+	static char answer[8192];
+	memset(out, 0, sizeof(*out));
+	if (http_request(SHADOWMOUNT_PORT, "POST", "/api/v1/games/storage/status", "{}", answer, sizeof(answer), 1000) ==
+	    200)
+		sources_parse_storage(answer, out);
 }

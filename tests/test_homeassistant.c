@@ -1,4 +1,4 @@
-/* Host tests: MQTT packets, the metrics subset, the discovery messages, commands and the config.
+/* Host tests: MQTT packets, the metrics subset, the discovery messages, commands, the config and live events.
  * Built by `make test` with AddressSanitizer and UBSan; no console or broker needed. */
 #include <stdint.h>
 #include <stdio.h>
@@ -8,10 +8,15 @@
 #include "../src/buf.h"
 #include "../src/config.h"
 #include "../src/discovery.h"
+#include "../src/events.h"
 #include "../src/json.h"
 #include "../src/mqtt.h"
+#include "../src/notifications.h"
 #include "../src/power.h"
 #include "../src/sources.h"
+#include "../third_party/sqlite/sqlite3.h"
+
+#include <unistd.h>
 
 static int g_failures;
 
@@ -205,6 +210,19 @@ static void test_discovery(void)
 	ok("discovery: both removed with power actions off", emptied == 2);
 	ok("discovery: the other entities do not depend on it", others_kept);
 
+	int events_found = 0;
+	for (int i = 0; i < discovery_count(); i++) {
+		buf_init(&b, storage, sizeof(storage));
+		discovery_message(i, "aabbccddeeff", &r, true, "0.1.0", topic, sizeof(topic), &b);
+		if (strcmp(topic, "homeassistant/event/ps5_aabbccddeeff/trophy/config") == 0)
+			ok("discovery: the trophy event's topic and grades",
+			   strstr(storage, "\"state_topic\":\"ps5/aabbccddeeff/event/trophy\"") &&
+			       strstr(storage, "\"event_types\":[\"bronze\",\"silver\",\"gold\",\"platinum\"]") &&
+			       strstr(storage, "command_topic") == NULL);
+		events_found += strncmp(topic, "homeassistant/event/", 20) == 0;
+	}
+	ok("discovery: four event entities", events_found == 4);
+
 	buf_init(&b, storage, sizeof(storage));
 	discovery_state(&r, &b);
 	ok("state: valid JSON with the escaped name", strstr(storage, "\"game\":\"A \\\"quoted\\\" game\"") != NULL);
@@ -308,6 +326,220 @@ static void test_config(void)
 	remove(CONFIG_PATH);
 }
 
+/* ---------------------------------------------------------------- events */
+
+static notification_row row(long long id, long long updated_ms, const char* channel, const char* use_case)
+{
+	notification_row n;
+	memset(&n, 0, sizeof(n));
+	n.id = id;
+	n.updated_ms = updated_ms;
+	snprintf(n.channel, sizeof(n.channel), "%s", channel);
+	snprintf(n.use_case, sizeof(n.use_case), "%s", use_case);
+	return n;
+}
+
+static notification_row trophy_row(long long id, long long updated_ms, const char* grade, const char* name)
+{
+	notification_row n = row(id, updated_ms, "Trophies", "NUC55");
+	snprintf(n.grade, sizeof(n.grade), "%s", grade);
+	snprintf(n.trophy_name, sizeof(n.trophy_name), "%s", name);
+	snprintf(n.trophy_id, sizeof(n.trophy_id), "7");
+	snprintf(n.np_comm_id, sizeof(n.np_comm_id), "NPWR00001_00");
+	return n;
+}
+
+static void test_events(void)
+{
+	const long long now = 1800000000000LL;
+	event_state s;
+	events_init(&s);
+	console_event out[8];
+
+	notification_row old[] = { trophy_row(10, now - 1000, "Bronze", "Old one"), row(11, now - 500, "Downloads", "NUC240") };
+	ok("events: the baseline sends nothing", events_from_notifications(&s, old, 2, now, out, 8) == 0);
+	ok("events: the baseline sets the cursor", s.last_id == 11 && s.last_updated_ms == now - 500);
+	ok("events: rows seen before send nothing", events_from_notifications(&s, old, 2, now, out, 8) == 0);
+
+	notification_row gold = trophy_row(12, now - 100, "Gold", "A \"quoted\" trophy");
+	int n = events_from_notifications(&s, &gold, 1, now, out, 8);
+	ok("events: a new gold trophy", n == 1 && strcmp(out[0].object, "trophy") == 0 &&
+	                                    strstr(out[0].payload, "\"event_type\":\"gold\"") != NULL);
+	ok("events: the trophy's name escaped, id and set", strstr(out[0].payload, "\"trophy\":\"A \\\"quoted\\\" trophy\"") &&
+	                                                         strstr(out[0].payload, "\"trophy_id\":\"7\"") &&
+	                                                         strstr(out[0].payload, "\"trophy_set\":\"NPWR00001_00\""));
+	ok("events: the payload is a JSON object", valid_json(out[0].payload));
+
+	notification_row mixed[5];
+	mixed[0] = row(13, now - 90, "Downloads", "IDC"); /* a homebrew notification, ours included */
+	mixed[1] = row(14, now - 80, "Downloads", "NUC240");
+	snprintf(mixed[1].title_id, sizeof(mixed[1].title_id), "PPSA00002");
+	snprintf(mixed[1].message, sizeof(mixed[1].message), "Installed.");
+	mixed[2] = row(15, now - EVENTS_MAX_AGE_MS - 1, "Downloads", "NUC246"); /* too old after an outage */
+	mixed[3] = row(16, now - 70, "SystemFeedback", "NUC411");
+	mixed[4] = trophy_row(17, now - 60, "Diamond", "Unknown grade");
+	n = events_from_notifications(&s, mixed, 5, now, out, 8);
+	ok("events: only the install is sent", n == 1 && strcmp(out[0].object, "download") == 0 &&
+	                                           strstr(out[0].payload, "\"event_type\":\"installed\"") &&
+	                                           strstr(out[0].payload, "\"title_id\":\"PPSA00002\"") &&
+	                                           strstr(out[0].payload, "\"message\":\"Installed.\""));
+	ok("events: the cursor passes every row, sent or not", s.last_id == 17);
+	ok("events: an unknown trophy grade is noted", strstr(s.skipped, "Diamond") != NULL);
+	notification_row other = row(18, now, "Downloads", "NUC999");
+	n = events_from_notifications(&s, &other, 1, now, out, 8);
+	ok("events: an unknown download kind is other", n == 1 && strstr(out[0].payload, "\"event_type\":\"other\""));
+
+	/* Games, from ps5-exporter's readings. */
+	readings r;
+	memset(&r, 0, sizeof(r));
+	ok("game: no exporter, no baseline", events_from_reading(&s, &r, out, 8) == 0 && !s.game_seen);
+	r.exporter = true;
+	r.game_running = true;
+	snprintf(r.game_id, sizeof(r.game_id), "PPSA00001");
+	snprintf(r.game_name, sizeof(r.game_name), "First");
+	ok("game: the baseline sends nothing", events_from_reading(&s, &r, out, 8) == 0);
+	ok("game: the same game sends nothing", events_from_reading(&s, &r, out, 8) == 0);
+	readings gone = r;
+	gone.exporter = false;
+	gone.game_running = false;
+	gone.game_id[0] = 0;
+	ok("game: the exporter missing is not a stop", events_from_reading(&s, &gone, out, 8) == 0 &&
+	                                                    strcmp(s.game_id, "PPSA00001") == 0);
+	snprintf(r.game_id, sizeof(r.game_id), "PPSA00002");
+	snprintf(r.game_name, sizeof(r.game_name), "Second");
+	n = events_from_reading(&s, &r, out, 8);
+	ok("game: a switch is a stop and a start", n == 2 && strstr(out[0].payload, "\"event_type\":\"stopped\"") &&
+	                                                strstr(out[0].payload, "\"game\":\"First\"") &&
+	                                                strstr(out[1].payload, "\"event_type\":\"started\"") &&
+	                                                strstr(out[1].payload, "\"title_id\":\"PPSA00002\""));
+	r.game_running = false;
+	n = events_from_reading(&s, &r, out, 8);
+	ok("game: quitting is a stop", n == 1 && strstr(out[0].payload, "\"stopped\"") && strstr(out[0].payload, "Second"));
+
+	/* ShadowMountPlus' storage jobs. */
+	storage_status st;
+	memset(&st, 0, sizeof(st));
+	ok("storage: no answer, nothing", events_from_storage(&s, &st, out, 8) == 0 && !s.storage_seen);
+	st.have = true;
+	st.job_id = 3;
+	snprintf(st.state, sizeof(st.state), "completed");
+	ok("storage: a job that ended before the baseline is not sent", events_from_storage(&s, &st, out, 8) == 0);
+	st.job_id = 4;
+	snprintf(st.state, sizeof(st.state), "transferring");
+	ok("storage: a running job sends nothing", events_from_storage(&s, &st, out, 8) == 0);
+	snprintf(st.state, sizeof(st.state), "completed");
+	snprintf(st.operation, sizeof(st.operation), "copy");
+	snprintf(st.destination, sizeof(st.destination), "/mnt/usb0/data/etaHEN/games/PPSA00001 A.ffpfsc");
+	n = events_from_storage(&s, &st, out, 8);
+	ok("storage: a finished copy", n == 1 && strcmp(out[0].object, "storage") == 0 &&
+	                                   strstr(out[0].payload, "\"event_type\":\"completed\"") &&
+	                                   strstr(out[0].payload, "\"operation\":\"copy\"") &&
+	                                   strstr(out[0].payload, "\"destination\":\"/mnt/usb0/data/etaHEN/games/PPSA00001 A.ffpfsc\""));
+	ok("storage: sent once", events_from_storage(&s, &st, out, 8) == 0);
+	st.job_id = 5;
+	snprintf(st.state, sizeof(st.state), "failed");
+	snprintf(st.error, sizeof(st.error), "a game is active");
+	n = events_from_storage(&s, &st, out, 8);
+	ok("storage: a failed job with its error", n == 1 && strstr(out[0].payload, "\"failed\"") &&
+	                                               strstr(out[0].payload, "\"error\":\"a game is active\""));
+	event_state fresh;
+	events_init(&fresh);
+	st.job_id = 7;
+	snprintf(st.state, sizeof(st.state), "transferring");
+	events_from_storage(&fresh, &st, out, 8);
+	snprintf(st.state, sizeof(st.state), "cancelled");
+	ok("storage: a job running at the baseline is sent when it ends", events_from_storage(&fresh, &st, out, 8) == 1);
+
+	const char* answer =
+		"{\"status\":0,\"job_id\":2,\"operation\":\"copy\",\"state\":\"completed\",\"active\":false,"
+		"\"title_id\":\"PPSA02225\",\"destination\":\"\\/mnt\\/usb0\\/data\\/etaHEN\\/games\\/PPSA02225 GOT.ffpfsc\","
+		"\"progress_percent\":100.0,\"result_status\":0,\"result_error\":\"\"}";
+	sources_parse_storage(answer, &st);
+	ok("storage: ShadowMountPlus' answer, fractions and escaped slashes",
+	   st.have && st.job_id == 2 && strcmp(st.state, "completed") == 0 && strcmp(st.operation, "copy") == 0 &&
+	       strcmp(st.title_id, "PPSA02225") == 0 &&
+	       strcmp(st.destination, "/mnt/usb0/data/etaHEN/games/PPSA02225 GOT.ffpfsc") == 0 && st.error[0] == 0);
+	sources_parse_storage("{\"status\":2,\"error\":\"storage job not found\"}", &st);
+	ok("storage: no job yet", !st.have);
+	sources_parse_storage("not json", &st);
+	ok("storage: garbage", !st.have);
+}
+
+/* --------------------------------------------------------- notifications */
+
+#define TEST_DB "build/notification-test.db"
+
+/* The schema of the system's notification2.db (decision log D9); the rows are made up. */
+static void db_exec(const char* sql)
+{
+	sqlite3* db;
+	sqlite3_open(TEST_DB, &db);
+	sqlite3_exec(db, sql, NULL, NULL, NULL);
+	sqlite3_close(db);
+}
+
+static void test_notifications(void)
+{
+	remove(TEST_DB);
+	db_exec("CREATE TABLE notification(    id INTEGER PRIMARY KEY AUTOINCREMENT,    user_id INTEGER DEFAULT -1,"
+	        "    originator INTEGER NOT NULL,    is_popped_up INTEGER DEFAULT 0,    server_sync_state INTEGER,"
+	        "    notification_id TEXT,    local_notification_id TEXT,    bundle_name TEXT,    state TEXT NOT NULL,"
+	        "    created_date_time INTEGER NOT NULL,    updated_date_time INTEGER NOT NULL,"
+	        "    expiration_date_time INTEGER,    raw_data TEXT NOT NULL,    upload_data TEXT,    cached_data TEXT,"
+	        "    extra_data TEXT );"
+	        "INSERT INTO notification(id, originator, bundle_name, state, created_date_time, updated_date_time, raw_data)"
+	        " VALUES (20, 0, 'local:Trophy', 'New', 1000, 1000,"
+	        " '{\"channelType\":\"Trophies\",\"useCaseId\":\"NUC55\",\"telemetryData\":{\"parameters\":"
+	        "{\"isTrophyAttained\":true,\"trophyGrade\":\"Silver\",\"trophyId\":\"3\",\"trophyName\":\"Made up\","
+	        "\"trophyNpCommId\":\"NPWR00001_00\"}},\"viewData\":{\"message\":{\"body\":\" Made up\"}}}'),"
+	        " (21, 0, NULL, 'New', 2000, 2000,"
+	        " '{\"channelType\":\"Downloads\",\"useCaseId\":\"NUC240\",\"viewData\":{\"icon\":{\"parameters\":"
+	        "{\"npTitleIds\":[\"PPSA00009_00\"]},\"type\":\"TitleByTitle\"},\"message\":{\"body\":\"Installed.\"}}}'),"
+	        " (22, 0, NULL, 'New', 3000, 3000, 'not json'),"
+	        " (23, 0, NULL, 'New', 4000, 4000,"
+	        " '{\"channelType\":\"Downloads\",\"useCaseId\":\"IDC\",\"viewData\":{\"message\":{\"body\":\"etaHEN\"}}}');");
+
+	notifications_reader reader;
+	notifications_init(&reader, TEST_DB);
+	static notification_row rows[NOTIFICATIONS_MAX_ROWS];
+	int count = 0;
+	char error[128];
+	notifications_result result = notifications_poll(&reader, 0, 0, rows, &count, error, sizeof(error));
+	ok("notifications: read from a copy", result == NOTIFICATIONS_READ);
+	ok("notifications: valid rows, oldest first, bad JSON skipped",
+	   count == 3 && rows[0].id == 20 && rows[1].id == 21 && rows[2].id == 23);
+	ok("notifications: the trophy's fields", strcmp(rows[0].channel, "Trophies") == 0 && strcmp(rows[0].grade, "Silver") == 0 &&
+	                                             strcmp(rows[0].trophy_name, "Made up") == 0 &&
+	                                             strcmp(rows[0].trophy_id, "3") == 0 &&
+	                                             strcmp(rows[0].np_comm_id, "NPWR00001_00") == 0);
+	ok("notifications: the title ID without _00, and the message",
+	   strcmp(rows[1].title_id, "PPSA00009") == 0 && strcmp(rows[1].message, "Installed.") == 0 && rows[1].updated_ms == 2000);
+	ok("notifications: an unchanged file is not read again",
+	   notifications_poll(&reader, 23, 4000, rows, &count, error, sizeof(error)) == NOTIFICATIONS_UNCHANGED);
+
+	usleep(20000); /* a later modification time */
+	db_exec("INSERT INTO notification(id, originator, state, created_date_time, updated_date_time, raw_data)"
+	        " VALUES (24, 0, 'New', 5000, 5000, '{\"channelType\":\"Trophies\",\"telemetryData\":"
+	        "{\"parameters\":{\"trophyGrade\":\"Platinum\"}}}');");
+	result = notifications_poll(&reader, 23, 4000, rows, &count, error, sizeof(error));
+	ok("notifications: only the new row after a change", result == NOTIFICATIONS_READ && count == 1 && rows[0].id == 24 &&
+	                                                         strcmp(rows[0].grade, "Platinum") == 0);
+
+	FILE* f = fopen(TEST_DB, "w");
+	if (f) {
+		fputs("this is not a database", f);
+		fclose(f);
+	}
+	result = notifications_poll(&reader, 24, 5000, rows, &count, error, sizeof(error));
+	ok("notifications: a file that is not SQLite is an error", result == NOTIFICATIONS_ERROR && error[0] != 0);
+	ok("notifications: and is not tried again until it changes",
+	   notifications_poll(&reader, 24, 5000, rows, &count, error, sizeof(error)) == NOTIFICATIONS_UNCHANGED);
+	remove(TEST_DB);
+	notifications_init(&reader, TEST_DB);
+	ok("notifications: a missing file is an error",
+	   notifications_poll(&reader, 0, 0, rows, &count, error, sizeof(error)) == NOTIFICATIONS_ERROR);
+}
+
 int main(void)
 {
 	test_mqtt();
@@ -315,6 +547,8 @@ int main(void)
 	test_discovery();
 	test_commands();
 	test_config();
+	test_events();
+	test_notifications();
 	printf("\n%s (%d failure%s)\n", g_failures ? "FAIL" : "PASS", g_failures, g_failures == 1 ? "" : "s");
 	return g_failures != 0;
 }

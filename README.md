@@ -25,6 +25,7 @@ it can show a notification on the screen.
 | Beep, Blink the light | button | ps5-signal |
 | Light colour (System, Blue, White, Orange, Purple, Pink, Off) | select | ps5-signal |
 | Rest mode, Power off (only when power actions are on) | button | the console |
+| Trophy, Download, Game started or stopped, Storage job | event | the console, ps5-exporter, ShadowMountPlus (see [Live events](#live-events)) |
 
 A value the console does not report shows as *Unknown*, never as 0. Without ps5-signal the light and beep entities
 show as unavailable. When the console sleeps (rest mode) or the payload stops, the whole device shows as
@@ -63,6 +64,59 @@ Two buttons then appear on the device:
 The console beeps (when ps5-signal runs) and shows a notification first ("Rest mode", "Turning off"). One power action per 10 seconds. Both use the
 system's own services (`sceSystemStateMgrEnterStandby`, `sceSystemStateMgrTurnOff`), not a raw reboot call.
 
+## Live events
+
+Four event entities fire when something happens on the console. Use them as automation triggers.
+
+| Entity | `event_type` | Other attributes | From |
+| --- | --- | --- | --- |
+| Trophy | `bronze`, `silver`, `gold`, `platinum` | `trophy`, `trophy_id`, `trophy_set` | the system's notifications |
+| Download | `installed`, `ready`, `addon_ready`, `update_added`, `other` | `title_id`, `message` | the system's notifications |
+| Game started or stopped | `started`, `stopped` | `title_id`, `game` | ps5-exporter, every reading interval |
+| Storage job | `completed`, `failed`, `cancelled` | `operation`, `title_id`, `destination`, `error` | ShadowMountPlus' copy, move, unpack and delete jobs |
+
+How they work:
+
+- Trophies and downloads come from the console's own notification list
+  (`/system_data/priv/mms/notification2.db`). The payload never opens that file in place: when it changed, it reads
+  a copy into memory and looks for new rows. It checks every 2 seconds. Notifications from homebrew (this payload's
+  own included) are not events.
+- Nothing fires for what happened before the payload started. After the connection to the broker was lost, an
+  event older than 10 minutes is not sent.
+- Nothing fires while the console sleeps.
+- The trophy fields are based on one trophy notification seen on a PS5 Pro (13.60). The other grades are expected in
+  the same form.
+
+An automation that flashes the lights for a gold or platinum trophy and blinks the console's light:
+
+```yaml
+automation:
+  - alias: PS5 trophy
+    triggers:
+      - trigger: state
+        entity_id: event.ps5_trophy
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state.attributes.event_type in ['gold', 'platinum'] }}"
+    actions:
+      - action: light.turn_on
+        target:
+          entity_id: light.living_room
+        data:
+          flash: short
+      - action: button.press
+        target:
+          entity_id: button.ps5_blink_the_light
+      - action: notify.send_message
+        target:
+          entity_id: notify.ps5_notification
+        data:
+          message: "{{ trigger.to_state.attributes.trophy }}"
+```
+
+Home Assistant names the entities after the device and its area, so `event.ps5_trophy` can be
+`event.living_room_ps5_trophy` on your system. Check the entity ID in Settings > Devices.
+
 ## Waking the console
 
 Not possible from Home Assistant on a jailbroken console. The payload sleeps in rest mode too, and Sony's network
@@ -95,6 +149,8 @@ The device appears in Home Assistant under Settings, Devices and services, MQTT,
 - **Commands** come from anyone who may publish on the broker: give the console's user its own password. Messages
   are checked (length, UTF-8, known colours), and ps5-signal limits beeps and light changes.
 - **Power actions** are off unless you switch them on, take only `PRESS`, and run at most once per 10 seconds.
+- **Live events** send the names of trophies and installed games to your broker. The notification database is only
+  read, from a copy; the payload never writes or locks it.
 
 ## Topics
 
@@ -109,6 +165,7 @@ For a console with id `<id>` (its MAC address without colons):
 | `ps5/<id>/command/beep`, `/blink` | any payload |
 | `ps5/<id>/command/colour` | a colour name from the list above |
 | `ps5/<id>/command/rest`, `/power_off` | `PRESS`; only while power actions are on |
+| `ps5/<id>/event/trophy`, `/download`, `/game`, `/storage` | `{"event_type": ..., ...}`, not retained |
 | `homeassistant/<component>/ps5_<id>/<object>/config` | discovery, retained; sent again when Home Assistant restarts |
 
 [docs/API.md](docs/API.md) describes the local API.

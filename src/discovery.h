@@ -6,6 +6,7 @@
  *   ps5/<id>/state              one JSON object with every value (retained)
  *   ps5/<id>/command/<action>   notify (text), beep, blink (any payload), colour (a preset name),
  *                               rest, power_off (PRESS; only while power actions are on)
+ *   ps5/<id>/event/<object>     trophy, download, game, storage: {"event_type": ..., ...} (not retained)
  *   homeassistant/<component>/ps5_<id>/<object>/config   discovery (retained) */
 #ifndef DISCOVERY_H
 #define DISCOVERY_H

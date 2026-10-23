@@ -35,9 +35,26 @@ typedef struct {
 	char address[16];       /* the console's IPv4 address on the network, "" when unknown */
 } readings;
 
+/* ShadowMountPlus' current or last storage job (copy, move, unpack, delete), from its HTTP API on 127.0.0.1:10101. */
+#define SHADOWMOUNT_PORT 10101
+
+typedef struct {
+	bool have;              /* ShadowMountPlus answered with a job */
+	long long job_id;
+	char state[16];         /* preparing ... completed, failed, cancelled */
+	char operation[16];     /* copy, move, unpack, delete */
+	char title_id[16];
+	char destination[256];
+	char error[128];        /* result_error, "" when none */
+} storage_status;
+
 /* Reads the subset of Prometheus text the bridge needs into out (pure; tested on the host). */
 void sources_parse_metrics(const char* text, size_t length, readings* out);
+/* Reads ShadowMountPlus' storage status answer into out (pure; tested on the host). */
+void sources_parse_storage(const char* text, storage_status* out);
 /* Asks both services. */
 void sources_read(readings* out);
+/* Asks ShadowMountPlus for its storage job; out->have is false when it does not answer or has had no job. */
+void sources_read_storage(storage_status* out);
 
 #endif
